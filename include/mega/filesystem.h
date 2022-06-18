@@ -22,9 +22,11 @@
 #ifndef MEGA_FILESYSTEM_H
 #define MEGA_FILESYSTEM_H 1
 
+#include <atomic>
 #include "types.h"
 #include "utils.h"
 #include "waiter.h"
+#include "filefingerprint.h"
 
 namespace mega {
 
@@ -42,12 +44,6 @@ enum FileSystemType
     FS_SDCARDFS = 7,
     FS_F2FS = 8,
     FS_XFS = 9
-};
-
-// generic host filesystem node ID interface
-struct MEGA_API FsNodeId
-{
-    virtual bool isequalto(FsNodeId*) = 0;
 };
 
 typedef void (*asyncfscallback)(void *);
@@ -108,6 +104,11 @@ class MEGA_API LocalPath
     friend int compareUtf(const LocalPath&, bool unescaping1, const string&, bool unescaping2, bool caseInsensitive);
     friend int compareUtf(const LocalPath&, bool unescaping1, const LocalPath&, bool unescaping2, bool caseInsensitive);
 
+#ifdef _WIN32
+    friend bool isPotentiallyInaccessibleName(const FileSystemAccess&, const LocalPath&, nodetype_t);
+    friend bool isPotentiallyInaccessiblePath(const FileSystemAccess&, const LocalPath&, nodetype_t);
+#endif // ! _WIN32
+
 public:
     LocalPath() {}
 
@@ -130,6 +131,7 @@ public:
     void append(const LocalPath& additionalPath);
     void appendWithSeparator(const LocalPath& additionalPath, bool separatorAlways);
     void prependWithSeparator(const LocalPath& additionalPath);
+    LocalPath prependNewWithSeparator(const LocalPath& additionalPath) const;
     void trimNonDriveTrailingSeparator();
     bool findNextSeparator(size_t& separatorBytePos) const;
     bool findPrevSeparator(size_t& separatorBytePos, const FileSystemAccess& fsaccess) const;
@@ -171,6 +173,7 @@ public:
     static LocalPath fromPlatformEncoded(string localname);
 #ifdef WIN32
     static LocalPath fromPlatformEncoded(wstring&& localname);
+    wchar_t driveLetter();
 #endif
 
     // Generates a name for a temporary file
@@ -179,6 +182,13 @@ public:
     bool operator==(const LocalPath& p) const { return localpath == p.localpath; }
     bool operator!=(const LocalPath& p) const { return localpath != p.localpath; }
     bool operator<(const LocalPath& p) const { return localpath < p.localpath; }
+};
+
+struct NameConflict {
+    string cloudPath;
+    vector<string> clashingCloudNames;
+    LocalPath localPath;
+    vector<LocalPath> clashingLocalNames;
 };
 
 void AddHiddenFileAttribute(mega::LocalPath& path);
@@ -288,7 +298,7 @@ struct MEGA_API FileAccess
     // blocking mode: open for reading, writing or reading and writing.
     // This one really does open the file, and openf(), closef() will have no effect
     // If iteratingDir is supplied, this fopen() call must be for the directory entry being iterated by dopen()/dnext()
-    virtual bool fopen(LocalPath&, bool read, bool write, DirAccess* iteratingDir = nullptr, bool ignoreAttributes = false) = 0;
+    virtual bool fopen(const LocalPath&, bool read, bool write, DirAccess* iteratingDir = nullptr, bool ignoreAttributes = false) = 0;
 
     // nonblocking open: Only prepares for opening.  Actually stats the file/folder, getting mtime, size, type.
     // Call openf() afterwards to actually open it if required.  For folders, returns false with type==FOLDERNODE.
@@ -355,13 +365,6 @@ protected:
     virtual void asyncsyswrite(AsyncIOContext*);
 };
 
-struct MEGA_API InputStreamAccess
-{
-    virtual m_off_t size() = 0;
-    virtual bool read(byte *, unsigned) = 0;
-    virtual ~InputStreamAccess() { }
-};
-
 class MEGA_API FileInputStream : public InputStreamAccess
 {
     FileAccess *fileAccess;
@@ -390,7 +393,12 @@ struct Notification
 {
     dstime timestamp;
     LocalPath path;
-    LocalNode* localnode;
+    LocalNode* localnode = nullptr;
+
+    Notification() {}
+    Notification(dstime ts, const LocalPath& p, LocalNode* ln)
+        : timestamp(ts), path(p), localnode(ln)
+        {}
 };
 
 struct NotificationDeque : ThreadSafeDeque<Notification>
@@ -408,7 +416,8 @@ struct NotificationDeque : ThreadSafeDeque<Notification>
     }
 };
 
-// generic filesystem change notification
+#ifdef ENABLE_SYNC
+// filesystem change notification, highly coupled to Syncs and LocalNodes.
 struct MEGA_API DirNotify
 {
     typedef enum { EXTRA, DIREVENTS, RETRY, NUMQUEUES } notifyqueue;
@@ -458,20 +467,21 @@ public:
 
     Sync *sync;
 
-    DirNotify(const LocalPath&, const LocalPath&);
+    DirNotify(const LocalPath&, const LocalPath&, Sync* s);
     virtual ~DirNotify() {}
 
     bool empty();
 };
+#endif
 
 // generic host filesystem access interface
 struct MEGA_API FileSystemAccess : public EventTrigger
 {
     // waiter to notify on filesystem events
-    Waiter *waiter;
+    Waiter *waiter = nullptr;
 
-    // indicate error reports are not necessary on this call as it'll be retried in a moment if there is a continuing problem
-    bool skip_errorreport;
+    // indicate target_exists error logging is not necessary on this call as we may try something else for overall operation success
+    bool skip_targetexists_errorreport = false;
 
     /**
      * @brief instantiate FileAccess object
@@ -483,9 +493,11 @@ struct MEGA_API FileSystemAccess : public EventTrigger
     // instantiate DirAccess object
     virtual DirAccess* newdiraccess() = 0;
 
+#ifdef ENABLE_SYNC
     // instantiate DirNotify object (default to periodic scanning handler if no
     // notification configured) with given root path
-    virtual DirNotify* newdirnotify(LocalPath&, LocalPath&, Waiter*);
+    virtual DirNotify* newdirnotify(const LocalPath&, const LocalPath&, Waiter*, LocalNode* syncroot);
+#endif
 
     // check if character is lowercase hex ASCII
     bool isControlChar(unsigned char c) const;
@@ -520,19 +532,19 @@ struct MEGA_API FileSystemAccess : public EventTrigger
     virtual bool getsname(const LocalPath&, LocalPath&) const = 0;
 
     // rename file, overwrite target
-    virtual bool renamelocal(LocalPath&, LocalPath&, bool = true) = 0;
+    virtual bool renamelocal(const LocalPath&, const LocalPath&, bool = true) = 0;
 
     // copy file, overwrite target, set mtime
     virtual bool copylocal(LocalPath&, LocalPath&, m_time_t) = 0;
 
     // delete file
-    virtual bool unlinklocal(LocalPath&) = 0;
+    virtual bool unlinklocal(const LocalPath&) = 0;
 
     // delete empty directory
-    virtual bool rmdirlocal(LocalPath&) = 0;
+    virtual bool rmdirlocal(const LocalPath&) = 0;
 
     // create directory, optionally hidden
-    virtual bool mkdirlocal(LocalPath&, bool = false) = 0;
+    virtual bool mkdirlocal(const LocalPath&, bool hidden, bool logAlreadyExistsError) = 0;
 
     // make sure that we stay within the range of timestamps supported by the server data structures (unsigned 32-bit)
     static void captimestamp(m_time_t*);
@@ -561,18 +573,20 @@ struct MEGA_API FileSystemAccess : public EventTrigger
     void setdefaultfolderpermissions(int) { }
 
     // convenience function for getting filesystem shortnames
-    std::unique_ptr<LocalPath> fsShortname(LocalPath& localpath);
+    std::unique_ptr<LocalPath> fsShortname(const LocalPath& localpath);
 
     // set whenever an operation fails due to a transient condition (e.g. locking violation)
-    bool transient_error;
+    bool transient_error = false;
 
+#ifdef ENABLE_SYNC
     // set whenever there was a global file notification error or permanent failure
     // (this is in addition to the DirNotify-local error)
     bool notifyerr;
     bool notifyfailed;
+#endif
 
     // set whenever an operation fails because the target already exists
-    bool target_exists;
+    bool target_exists = false;
 
     // append local operating system version information to string.
     // Set includeArchExtraInfo to know if the app is 32 bit running on 64 bit (on windows, that is via the WOW subsystem)
@@ -581,7 +595,7 @@ struct MEGA_API FileSystemAccess : public EventTrigger
     // append id for stats
     virtual void statsid(string*) const { }
 
-    MegaClient* client;
+    MegaClient* client = nullptr;
 
     FileSystemAccess();
     virtual ~FileSystemAccess() { }
@@ -589,6 +603,22 @@ struct MEGA_API FileSystemAccess : public EventTrigger
     // Get the current working directory.
     virtual bool cwd(LocalPath& path) const = 0;
 };
+
+enum FilenameAnomalyType
+{
+    FILENAME_ANOMALY_NAME_MISMATCH = 0,
+    FILENAME_ANOMALY_NAME_RESERVED = 1,
+    // This should always be last.
+    FILENAME_ANOMALY_NONE
+}; // FilenameAnomalyType
+
+class FilenameAnomalyReporter
+{
+public:
+    virtual ~FilenameAnomalyReporter() { };
+
+    virtual void anomalyDetected(FilenameAnomalyType type, const string& localPath, const string& remotePath) = 0;
+}; // FilenameAnomalyReporter
 
 bool isCaseInsensitive(const FileSystemType type);
 
@@ -602,6 +632,33 @@ int platformCompareUtf(const string&, bool unescape1, const string&, bool unesca
 int platformCompareUtf(const string&, bool unescape1, const LocalPath&, bool unescape2);
 int platformCompareUtf(const LocalPath&, bool unescape1, const string&, bool unescape2);
 int platformCompareUtf(const LocalPath&, bool unescape1, const LocalPath&, bool unescape2);
+
+// Returns true if name is a reserved file name.
+//
+// On Windows, a reserved file name is:
+//   - AUX, COM[0-9], CON, LPT[0-9], NUL or PRN.
+bool isReservedName(const string& name, nodetype_t type = FILENODE);
+
+// Checks if there is a filename anomaly.
+//
+// @param localPath
+// The local path of the file in question.
+//
+// @param node
+// The remote node representing the file in question.
+//
+// @return
+// FILENAME_ANOMALY_NAME_MISMATCH
+// - If the local and remote file name differs.
+// FILENAME_ANOMALY_NAME_RESERVED
+// - If the remote file name is reserved.
+// FILENAME_ANOMALY_NONE
+// - If no anomalies were detected.
+FilenameAnomalyType isFilenameAnomaly(const LocalPath& localPath, const string& remoteName, nodetype_t type = FILENODE);
+FilenameAnomalyType isFilenameAnomaly(const LocalPath& localPath, const Node* node);
+#ifdef ENABLE_SYNC
+FilenameAnomalyType isFilenameAnomaly(const LocalNode& node);
+#endif
 
 } // namespace
 

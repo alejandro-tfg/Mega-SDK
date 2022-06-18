@@ -29,6 +29,8 @@
 #import "MEGAPushNotificationSettings+init.h"
 #import "MEGABannerList.h"
 #import "MEGABannerList+init.h"
+#import "MEGAHandleList+init.h"
+#import "MEGACurrency+init.h"
 
 using namespace mega;
 
@@ -177,6 +179,10 @@ using namespace mega;
     return self.megaRequest ? [[MEGAPricing alloc] initWithMegaPricing:self.megaRequest->getPricing() cMemoryOwn:YES] : nil;
 }
 
+- (MEGACurrency *)currency {
+    return self.megaRequest ? [[MEGACurrency alloc] initWithMegaCurrency:self.megaRequest->getCurrency() cMemoryOwn:YES] : nil;
+}
+
 - (MEGAAchievementsDetails *)megaAchievementsDetails {
     return self.megaRequest ? [[MEGAAchievementsDetails alloc] initWithMegaAchievementsDetails:self.megaRequest->getMegaAchievementsDetails() cMemoryOwn:YES] : nil;
 }
@@ -250,6 +256,15 @@ using namespace mega;
 - (MEGABannerList *)bannerList {
     MegaBannerList *bannerList = self.megaRequest->getMegaBannerList() -> copy();
     return [[MEGABannerList alloc] initWithMegaBannerList:bannerList cMemoryOwn:YES];
+}
+
+- (NSArray<NSNumber *> *)megaHandleArray {
+    MEGAHandleList *handleList = [MEGAHandleList.alloc initWithMegaHandleList:self.megaRequest->getMegaHandleList()->copy() cMemoryOwn:YES];
+    NSMutableArray<NSNumber *> *handleArray = [NSMutableArray.alloc initWithCapacity:handleList.size];
+    for (int i = 0; i < handleList.size; i++) {
+        [handleArray addObject:[NSNumber numberWithUnsignedLongLong:[handleList megaHandleAtIndex:i]]];
+    }
+    return handleArray.copy;
 }
 
 @end

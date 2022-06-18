@@ -35,8 +35,10 @@ public:
 
     DefaultedFileSystemAccess()
     {
+#ifdef ENABLE_SYNC
         notifyerr = false;
         notifyfailed = true;
+#endif   // ENABLE_SYNC
     }
     std::unique_ptr<mega::FileAccess> newfileaccess(bool followSymLinks = true) override
     {
@@ -90,7 +92,7 @@ public:
     {
         throw NotImplemented{__func__};
     }
-    bool renamelocal(mega::LocalPath&, mega::LocalPath&, bool = true) override
+    bool renamelocal(const mega::LocalPath&, const mega::LocalPath&, bool = true) override
     {
         throw NotImplemented{__func__};
     }
@@ -98,15 +100,15 @@ public:
     {
         throw NotImplemented{__func__};
     }
-    bool unlinklocal(mega::LocalPath&) override
+    bool unlinklocal(const mega::LocalPath&) override
     {
         throw NotImplemented{__func__};
     }
-    bool rmdirlocal(mega::LocalPath&) override
+    bool rmdirlocal(const mega::LocalPath&) override
     {
         throw NotImplemented{__func__};
     }
-    bool mkdirlocal(mega::LocalPath&, bool = false) override
+    bool mkdirlocal(const mega::LocalPath&, bool, bool) override
     {
         throw NotImplemented{__func__};
     }

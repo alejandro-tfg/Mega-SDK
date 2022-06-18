@@ -506,7 +506,7 @@ int PosixFileAccess::stealFileDescriptor()
     return toret;
 }
 
-bool PosixFileAccess::fopen(LocalPath& f, bool read, bool write, DirAccess* iteratingDir, bool)
+bool PosixFileAccess::fopen(const LocalPath& f, bool read, bool write, DirAccess* iteratingDir, bool)
 {
     struct stat statbuf;
 
@@ -681,8 +681,10 @@ PosixFileSystemAccess::PosixFileSystemAccess(int fseventsfd)
 {
     assert(sizeof(off_t) == 8);
 
+#ifdef ENABLE_SYNC
     notifyerr = false;
     notifyfailed = true;
+#endif
     notifyfd = -1;
 
     defaultfilepermissions = 0600;
@@ -706,7 +708,9 @@ PosixFileSystemAccess::PosixFileSystemAccess(int fseventsfd)
     lastlocalnode = NULL;
     if ((notifyfd = inotify_init1(IN_NONBLOCK)) >= 0)
     {
+#ifdef ENABLE_SYNC
         notifyfailed = false;
+#endif
     }
 #endif
 
@@ -761,11 +765,13 @@ PosixFileSystemAccess::PosixFileSystemAccess(int fseventsfd)
 
         if (ioctl(fd, FSEVENTS_CLONE, (char*)&fca) >= 0)
         {
-            close(fd);
+            if (fseventsfd < 0) close(fd);
 
             if (ioctl(notifyfd, FSEVENTS_WANT_EXTENDED_INFO, NULL) >= 0)
             {
+#ifdef ENABLE_SYNC
                 notifyfailed = false;
+#endif
             }
             else
             {
@@ -774,7 +780,7 @@ PosixFileSystemAccess::PosixFileSystemAccess(int fseventsfd)
         }
         else
         {
-            close(fd);
+            if (fseventsfd < 0) close(fd);
         }
     }
 #else
@@ -841,7 +847,7 @@ int PosixFileSystemAccess::checkevents(Waiter* w)
     if (MEGA_FD_ISSET(notifyfd, &pw->rfds))
     {
         char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
-        int p, l;
+        ssize_t p, l;
         inotify_event* in;
         wdlocalnode_map::iterator it;
         string localpath;
@@ -902,7 +908,7 @@ int PosixFileSystemAccess::checkevents(Waiter* w)
                                 lastcookie = 0;
 
                                 ignore = &it->second->sync->dirnotify->ignore.localpath;
-                                unsigned int insize = strlen(in->name);
+                                size_t insize = strlen(in->name);
 
                                 if (insize < ignore->size()
                                  || memcmp(in->name, ignore->data(), ignore->size())
@@ -1152,7 +1158,7 @@ bool PosixFileSystemAccess::getsname(const LocalPath&, LocalPath&) const
     return false;
 }
 
-bool PosixFileSystemAccess::renamelocal(LocalPath& oldname, LocalPath& newname, bool override)
+bool PosixFileSystemAccess::renamelocal(const LocalPath& oldname, const LocalPath& newname, bool override)
 {
 #ifdef USE_IOS
     const string oldnamestr = adjustBasePath(oldname);
@@ -1174,7 +1180,7 @@ bool PosixFileSystemAccess::renamelocal(LocalPath& oldname, LocalPath& newname, 
     transient_error = !existingandcare && (errno == ETXTBSY || errno == EBUSY);
 
     int e = errno;
-    if (!skip_errorreport)
+    if (e != EEXIST  || !skip_targetexists_errorreport)
     {
         LOG_warn << "Unable to move file: " << oldnamestr << " to " << newnamestr << ". Error code: " << e;
     }
@@ -1250,7 +1256,7 @@ bool PosixFileSystemAccess::copylocal(LocalPath& oldname, LocalPath& newname, m_
     return !t;
 }
 
-bool PosixFileSystemAccess::unlinklocal(LocalPath& name)
+bool PosixFileSystemAccess::unlinklocal(const LocalPath& name)
 {
     if (!unlink(adjustBasePath(name).c_str()))
     {
@@ -1264,8 +1270,10 @@ bool PosixFileSystemAccess::unlinklocal(LocalPath& name)
 
 // delete all files, folders and symlinks contained in the specified folder
 // (does not recurse into mounted devices)
-void PosixFileSystemAccess::emptydirlocal(LocalPath& name, dev_t basedev)
+void PosixFileSystemAccess::emptydirlocal(const LocalPath& nameParam, dev_t basedev)
 {
+    LocalPath name = nameParam;
+
     DIR* dp;
     dirent* d;
     int removed;
@@ -1358,7 +1366,7 @@ void PosixFileSystemAccess::setdefaultfolderpermissions(int permissions)
     defaultfolderpermissions = permissions | 0700;
 }
 
-bool PosixFileSystemAccess::rmdirlocal(LocalPath& name)
+bool PosixFileSystemAccess::rmdirlocal(const LocalPath& name)
 {
     emptydirlocal(name);
 
@@ -1372,7 +1380,7 @@ bool PosixFileSystemAccess::rmdirlocal(LocalPath& name)
     return false;
 }
 
-bool PosixFileSystemAccess::mkdirlocal(LocalPath& name, bool)
+bool PosixFileSystemAccess::mkdirlocal(const LocalPath& name, bool, bool logAlreadyExistsError)
 {
 #ifdef USE_IOS
     const string nameStr = adjustBasePath(name);
@@ -1390,7 +1398,10 @@ bool PosixFileSystemAccess::mkdirlocal(LocalPath& name, bool)
         target_exists = errno == EEXIST;
         if (target_exists)
         {
-            LOG_debug << "Error creating local directory: " << nameStr << " errno: " << errno;
+            if (logAlreadyExistsError)
+            {
+                LOG_debug << "Failed to create local directory: " << nameStr << " (already exists)";
+            }
         }
         else
         {
@@ -1787,7 +1798,7 @@ void PosixFileSystemAccess::statsid(string *id) const
     }
 
     char buff[512];
-    int len = read(fd, buff, 512);
+    ssize_t len = read(fd, buff, 512);
     close(fd);
 
     if (len <= 0)
@@ -1807,8 +1818,10 @@ void PosixFileSystemAccess::statsid(string *id) const
 #endif
 }
 
-PosixDirNotify::PosixDirNotify(LocalPath& localbasepath, const LocalPath& ignore)
-  : DirNotify(localbasepath, ignore)
+#ifdef ENABLE_SYNC
+
+PosixDirNotify::PosixDirNotify(const LocalPath& localbasepath, const LocalPath& ignore, Sync* s)
+  : DirNotify(localbasepath, ignore, s)
 {
 #ifdef USE_INOTIFY
     setFailed(0, "");
@@ -1823,7 +1836,6 @@ PosixDirNotify::PosixDirNotify(LocalPath& localbasepath, const LocalPath& ignore
 
 void PosixDirNotify::addnotify(LocalNode* l, const LocalPath& path)
 {
-#ifdef ENABLE_SYNC
 #ifdef USE_INOTIFY
     int wd;
 
@@ -1841,18 +1853,15 @@ void PosixDirNotify::addnotify(LocalNode* l, const LocalPath& path)
         LOG_warn << "Unable to addnotify path: " <<  path.localpath.c_str() << ". Error code: " << errno;
     }
 #endif
-#endif
 }
 
 void PosixDirNotify::delnotify(LocalNode* l)
 {
-#ifdef ENABLE_SYNC
 #ifdef USE_INOTIFY
     if (fsaccess->wdnodes.erase((int)(long)l->dirnotifytag))
     {
         inotify_rm_watch(fsaccess->notifyfd, (int)l->dirnotifytag);
     }
-#endif
 #endif
 }
 
@@ -1865,8 +1874,9 @@ fsfp_t PosixDirNotify::fsfingerprint() const
     {
         return 0;
     }
-
-    return *(fsfp_t*)&statfsbuf.f_fsid + 1;
+    fsfp_t tmp;
+    memcpy(&tmp, &statfsbuf.f_fsid, sizeof(fsfp_t));
+    return tmp+1;
 }
 
 bool PosixDirNotify::fsstableids() const
@@ -1889,6 +1899,7 @@ bool PosixDirNotify::fsstableids() const
         && statfsbuf.f_type != 0x65735546; // FUSE
 #endif
 }
+#endif // ENABLE_SYNC
 
 std::unique_ptr<FileAccess> PosixFileSystemAccess::newfileaccess(bool followSymLinks)
 {
@@ -1900,14 +1911,16 @@ DirAccess* PosixFileSystemAccess::newdiraccess()
     return new PosixDirAccess();
 }
 
-DirNotify* PosixFileSystemAccess::newdirnotify(LocalPath& localpath, LocalPath& ignore, Waiter*)
+#ifdef ENABLE_SYNC
+DirNotify* PosixFileSystemAccess::newdirnotify(const LocalPath& localpath, const LocalPath& ignore, Waiter*, LocalNode* syncroot)
 {
-    PosixDirNotify* dirnotify = new PosixDirNotify(localpath, ignore);
+    PosixDirNotify* dirnotify = new PosixDirNotify(localpath, ignore, syncroot->sync);
 
     dirnotify->fsaccess = this;
 
     return dirnotify;
 }
+#endif
 
 bool PosixFileSystemAccess::issyncsupported(const LocalPath& localpathArg, bool& isnetwork, SyncError& syncError, SyncWarning& syncWarning)
 {
@@ -2121,4 +2134,10 @@ PosixDirAccess::~PosixDirAccess()
         globfree(&globbuf);
     }
 }
+
+bool isReservedName(const string&, nodetype_t)
+{
+    return false;
+}
+
 } // namespace

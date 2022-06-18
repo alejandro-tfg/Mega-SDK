@@ -494,27 +494,27 @@ bool assignFilesystemIds(Sync& sync, MegaApp& app, FileSystemAccess& fsaccess, h
 
 SyncConfig::SyncConfig(LocalPath localPath,
                        std::string name,
-                       const handle remoteNode,
+                       NodeHandle remoteNode,
                        const std::string &remotePath,
                        const fsfp_t localFingerprint,
-                       std::vector<std::string> regExps,
+                       const LocalPath& externalDrivePath,
                        const bool enabled,
                        const SyncConfig::Type syncType,
                        const SyncError error,
                        const SyncWarning warning,
                        mega::handle hearBeatID)
-    : mEnabled{enabled}
-    , mLocalPath{std::move(localPath)}
-    , mName{std::move(name)}
-    , mRemoteNode{remoteNode}
-    , mOrigninalPathOfRemoteRootNode{remotePath}
-    , mLocalFingerprint{localFingerprint}
-    , mRegExps{std::move(regExps)}
-    , mSyncType{syncType}
-    , mError{error}
-    , mWarning{warning}
+    : mEnabled(enabled)
+    , mLocalPath(std::move(localPath))
+    , mName(std::move(name))
+    , mRemoteNode(remoteNode)
+    , mOriginalPathOfRemoteRootNode(remotePath)
+    , mLocalFingerprint(localFingerprint)
+    , mSyncType(syncType)
+    , mError(error)
+    , mWarning(warning)
     , mBackupId(hearBeatID)
-    , mExternalDrivePath()
+    , mExternalDrivePath(externalDrivePath)
+    , mBackupState(SYNC_BACKUP_NONE)
 {}
 
 bool SyncConfig::operator==(const SyncConfig& rhs) const
@@ -524,13 +524,13 @@ bool SyncConfig::operator==(const SyncConfig& rhs) const
            && mLocalPath == rhs.mLocalPath
            && mName == rhs.mName
            && mRemoteNode == rhs.mRemoteNode
-           && mOrigninalPathOfRemoteRootNode == rhs.mOrigninalPathOfRemoteRootNode
+           && mOriginalPathOfRemoteRootNode == rhs.mOriginalPathOfRemoteRootNode
            && mLocalFingerprint == rhs.mLocalFingerprint
-           && mRegExps == rhs.mRegExps
            && mSyncType == rhs.mSyncType
            && mError == rhs.mError
            && mBackupId == rhs.mBackupId
-           && mWarning == rhs.mWarning;
+           && mWarning == rhs.mWarning
+           && mBackupState == rhs.mBackupState;
 }
 
 bool SyncConfig::operator!=(const SyncConfig& rhs) const
@@ -553,12 +553,12 @@ const LocalPath& SyncConfig::getLocalPath() const
     return mLocalPath;
 }
 
-handle SyncConfig::getRemoteNode() const
+NodeHandle SyncConfig::getRemoteNode() const
 {
     return mRemoteNode;
 }
 
-void SyncConfig::setRemoteNode(const handle &remoteNode)
+void SyncConfig::setRemoteNode(NodeHandle remoteNode)
 {
     mRemoteNode = remoteNode;
 }
@@ -571,16 +571,6 @@ handle SyncConfig::getLocalFingerprint() const
 void SyncConfig::setLocalFingerprint(fsfp_t fingerprint)
 {
     mLocalFingerprint = fingerprint;
-}
-
-const std::vector<std::string>& SyncConfig::getRegExps() const
-{
-    return mRegExps;
-}
-
-void SyncConfig::setRegExps(std::vector<std::string>&& v)
-{
-    mRegExps = std::move(v);
 }
 
 SyncConfig::Type SyncConfig::getType() const
@@ -609,9 +599,19 @@ void SyncConfig::setBackupId(const handle &backupId)
     mBackupId = backupId;
 }
 
+bool SyncConfig::isBackup() const
+{
+    return mSyncType == TYPE_BACKUP;
+}
+
 bool SyncConfig::isExternal() const
 {
     return !mExternalDrivePath.empty();
+}
+
+bool SyncConfig::isInternal() const
+{
+    return mExternalDrivePath.empty();
 }
 
 bool SyncConfig::errorOrEnabledChanged()
@@ -675,6 +675,7 @@ std::string SyncConfig::syncErrorToStr(SyncError errorCode)
     case ACTIVE_SYNC_ABOVE_PATH:
         return "Active sync above path";
     case REMOTE_PATH_DELETED:
+        assert(false);  // obsolete, should not happen
         return "Remote node has been deleted";
     case REMOTE_NODE_INSIDE_RUBBISH:
         return "Remote node is inside Rubbish Bin";
@@ -690,11 +691,31 @@ std::string SyncConfig::syncErrorToStr(SyncError errorCode)
         return "Too many changes in account, local state invalid";
     case LOGGED_OUT:
         return "Session closed";
+    case WHOLE_ACCOUNT_REFETCHED:
+        return "The whole account was reloaded, missed updates could not have been applied in an orderly fashion";
+    case MISSING_PARENT_NODE:
+        return "Unable to figure out some node correspondence";
     case BACKUP_MODIFIED:
         return "Backup externally modified";
+    case BACKUP_SOURCE_NOT_BELOW_DRIVE:
+        return "Backup source path not below drive path.";
+    case SYNC_CONFIG_WRITE_FAILURE:
+        return "Unable to write sync config to disk.";
     default:
         return "Undefined error";
     }
+}
+
+void SyncConfig::setBackupState(SyncBackupState state)
+{
+    assert(isBackup());
+
+    mBackupState = state;
+}
+
+SyncBackupState SyncConfig::getBackupState() const
+{
+    return mBackupState;
 }
 
 const char* SyncConfig::syncstatename(const syncstate_t state)
@@ -733,6 +754,35 @@ const char* SyncConfig::synctypename(const SyncConfig::Type type)
     }
 }
 
+bool SyncConfig::synctypefromname(const string& name, Type& type)
+{
+    if (name == "BACKUP")
+    {
+        return type = TYPE_BACKUP, true;
+    }
+    if (name == "DOWN")
+    {
+        return type = TYPE_DOWN, true;
+    }
+    else if (name == "UP")
+    {
+        return type = TYPE_UP, true;
+    }
+    else if (name == "TWOWAY")
+    {
+        return type = TYPE_TWOWAY, true;
+    }
+
+    assert(!"Unknown sync type name.");
+
+    return false;
+}
+
+SyncError SyncConfig::knownError() const
+{
+    return mKnownError;
+}
+
 // new Syncs are automatically inserted into the session's syncs list
 // and a full read of the subtree is initiated
 Sync::Sync(UnifiedSync& us, const char* cdebris,
@@ -753,35 +803,51 @@ Sync::Sync(UnifiedSync& us, const char* cdebris,
     localnodes[FILENODE] = 0;
     localnodes[FOLDERNODE] = 0;
 
-    state = SYNC_INITIALSCAN;
-    statecachetable = NULL;
+    state() = SYNC_INITIALSCAN;
 
     fullscan = true;
     scanseqno = 0;
 
     mLocalPath = mUnifiedSync.mConfig.getLocalPath();
 
-    mBackupState = mUnifiedSync.mConfig.getType() == SyncConfig::TYPE_BACKUP
-                   ? SYNC_BACKUP_MIRROR
-                   : SYNC_BACKUP_NONE;
+    // If we're a backup sync...
+    if (mUnifiedSync.mConfig.isBackup())
+    {
+        auto& config = mUnifiedSync.mConfig;
+
+        auto firstTime = config.mBackupState == SYNC_BACKUP_NONE;
+        auto isExternal = config.isExternal();
+        auto wasDisabled = config.knownError() == BACKUP_MODIFIED;
+
+        if (firstTime || isExternal || wasDisabled)
+        {
+            // Then we must come up in mirroring mode.
+            mUnifiedSync.mConfig.mBackupState = SYNC_BACKUP_MIRROR;
+        }
+    }
 
     if (cdebris)
     {
         debris = cdebris;
         localdebris = LocalPath::fromPath(debris, *client->fsaccess);
-
-        dirnotify.reset(client->fsaccess->newdirnotify(mLocalPath, localdebris, client->waiter));
-
         localdebris.prependWithSeparator(mLocalPath);
     }
     else
     {
         localdebris = *clocaldebris;
-
-        // FIXME: pass last segment of localdebris
-        dirnotify.reset(client->fsaccess->newdirnotify(mLocalPath, localdebris, client->waiter));
     }
-    dirnotify->sync = this;
+
+    mFilesystemType = client->fsaccess->getlocalfstype(mLocalPath);
+
+    localroot->init(this, FOLDERNODE, NULL, mLocalPath, nullptr);  // the root node must have the absolute path.  We don't store shortname, to avoid accidentally using relative paths.
+    localroot->setnode(remotenode);
+
+    // notifications may be queueing from this moment
+    dirnotify.reset(client->fsaccess->newdirnotify(mLocalPath, localdebris.leafName(), client->waiter, localroot.get()));
+    assert(dirnotify->sync == this);
+
+    // order issue - localroot->init() couldn't do this until dirnotify is created but that needs
+    dirnotify->addnotify(localroot.get(), mLocalPath);
 
     // set specified fsfp or get from fs if none
     const auto cfsfp = mUnifiedSync.mConfig.getLocalFingerprint();
@@ -797,10 +863,6 @@ Sync::Sync(UnifiedSync& us, const char* cdebris,
     fsstableids = dirnotify->fsstableids();
     LOG_info << "Filesystem IDs are stable: " << fsstableids;
 
-    mFilesystemType = client->fsaccess->getlocalfstype(mLocalPath);
-
-    localroot->init(this, FOLDERNODE, NULL, mLocalPath, nullptr);  // the root node must have the absolute path.  We don't store shortname, to avoid accidentally using relative paths.
-    localroot->setnode(remotenode);
 
 #ifdef __APPLE__
     if (macOSmajorVersion() >= 19) //macOS catalina+
@@ -832,6 +894,7 @@ Sync::Sync(UnifiedSync& us, const char* cdebris,
     }
 #endif
 
+    // load LocalNodes from cache (only for internal syncs)
     if (client->dbaccess && !us.mConfig.isExternal())
     {
         // open state cache table
@@ -849,7 +912,7 @@ Sync::Sync(UnifiedSync& us, const char* cdebris,
             dbname.resize(sizeof tableid * 4 / 3 + 3);
             dbname.resize(Base64::btoa((byte*)tableid, sizeof tableid, (char*)dbname.c_str()));
 
-            statecachetable = client->dbaccess->open(client->rng, *client->fsaccess, dbname);
+            statecachetable.reset(client->dbaccess->open(client->rng, *client->fsaccess, dbname));
 
             readstatecache();
         }
@@ -874,8 +937,8 @@ Sync::~Sync()
         client->proctree(localroot->node, &tdsg);
     }
 
-    // The database is closed; deleting localnodes will not remove them
-    delete statecachetable;
+    // Close the database so that deleting localnodes will not remove them
+    statecachetable.reset();
 
     client->syncactivity = true;
 
@@ -895,24 +958,36 @@ bool Sync::backupModified()
 
 bool Sync::isBackup() const
 {
-    return mBackupState != SYNC_BACKUP_NONE;
+    return getConfig().isBackup();
 }
 
-bool Sync::isBackupMirroring() const
+bool Sync::isBackupAndMirroring() const
 {
-    return mBackupState == SYNC_BACKUP_MIRROR;
+    return isBackup() &&
+           getConfig().getBackupState() == SYNC_BACKUP_MIRROR;
 }
 
 bool Sync::isBackupMonitoring() const
 {
-    return mBackupState == SYNC_BACKUP_MONITOR;
+    return getConfig().getBackupState() == SYNC_BACKUP_MONITOR;
 }
 
-void Sync::backupMonitor()
+void Sync::setBackupMonitoring()
 {
-    assert(mBackupState == SYNC_BACKUP_MIRROR);
+    auto& config = getConfig();
 
-    mBackupState = SYNC_BACKUP_MONITOR;
+    assert(config.getBackupState() == SYNC_BACKUP_MIRROR);
+
+    config.setBackupState(SYNC_BACKUP_MONITOR);
+
+    assert(client);
+
+    client->syncs.saveSyncConfig(config);
+}
+
+bool Sync::active() const
+{
+    return getConfig().mRunningState >= SYNC_INITIALSCAN;
 }
 
 void Sync::addstatecachechildren(uint32_t parent_dbid, idlocalnode_map* tmap, LocalPath& localpath, LocalNode *p, int maxdepth)
@@ -981,7 +1056,7 @@ void Sync::addstatecachechildren(uint32_t parent_dbid, idlocalnode_map* tmap, Lo
 
 bool Sync::readstatecache()
 {
-    if (statecachetable && state == SYNC_INITIALSCAN)
+    if (statecachetable && state() == SYNC_INITIALSCAN)
     {
         string cachedata;
         idlocalnode_map tmap;
@@ -1019,10 +1094,15 @@ SyncConfig& Sync::getConfig()
     return mUnifiedSync.mConfig;
 }
 
+const SyncConfig& Sync::getConfig() const
+{
+    return mUnifiedSync.mConfig;
+}
+
 // remove LocalNode from DB cache
 void Sync::statecachedel(LocalNode* l)
 {
-    if (state == SYNC_CANCELED)
+    if (state() == SYNC_CANCELED)
     {
         return;
     }
@@ -1044,7 +1124,7 @@ void Sync::statecachedel(LocalNode* l)
 // insert LocalNode into DB cache
 void Sync::statecacheadd(LocalNode* l)
 {
-    if (state == SYNC_CANCELED)
+    if (state() == SYNC_CANCELED)
     {
         return;
     }
@@ -1064,9 +1144,11 @@ void Sync::cachenodes()
     {
         deleteq.clear();
         insertq.clear();
+        return;
     }
 
-    if ((state == SYNC_ACTIVE || (state == SYNC_INITIALSCAN && insertq.size() > 100)) && (deleteq.size() || insertq.size()))
+    if ((state() == SYNC_ACTIVE ||
+        (state() == SYNC_INITIALSCAN && insertq.size() > 100)) && (deleteq.size() || insertq.size()))
     {
         LOG_debug << "Saving LocalNode database with " << insertq.size() << " additions and " << deleteq.size() << " deletions";
         statecachetable->begin();
@@ -1108,22 +1190,41 @@ void Sync::cachenodes()
 
 void Sync::changestate(syncstate_t newstate, SyncError newSyncError, bool newEnableFlag, bool notifyApp)
 {
-    getConfig().setError(newSyncError);
-    getConfig().setEnabled(newEnableFlag);
+    auto& config = getConfig();
 
-    if (newstate != state)
+    // Transitioning to a 'stopped' state...
+    if (newstate < SYNC_INITIALSCAN)
     {
-        auto oldstate = state;
-        state = newstate;
+        // Should "user-disable" external backups...
+        newEnableFlag &= config.isInternal();
+    }
+
+    if (!newEnableFlag && statecachetable)
+    {
+        // make sure db is up to date before we close it.
+        cachenodes();
+
+        // remove the LocalNode database files on sync disablement (historic behaviour; sync re-enable with LocalNode state from non-matching SCSN is not supported (yet))
+        statecachetable->remove();
+        statecachetable.reset();
+    }
+
+    config.setError(newSyncError);
+    config.setEnabled(newEnableFlag);
+
+    if (newstate != state())
+    {
+        auto oldstate = state();
+        state() = newstate;
         fullscan = false;
 
         if (notifyApp)
         {
-            bool wasActive = oldstate == SYNC_ACTIVE;
+            bool wasActive = oldstate == SYNC_ACTIVE || oldstate == SYNC_INITIALSCAN;
             bool nowActive = newstate == SYNC_ACTIVE;
             if (wasActive != nowActive)
             {
-                mUnifiedSync.mClient.app->syncupdate_active(getConfig().getBackupId(), nowActive);
+                mUnifiedSync.mClient.app->syncupdate_active(config, nowActive);
             }
         }
     }
@@ -1134,9 +1235,9 @@ void Sync::changestate(syncstate_t newstate, SyncError newSyncError, bool newEna
     }
 }
 
-// walk path and return corresponding LocalNode and its parent
-// path must be relative to l or start with the root prefix if l == NULL
-// path must be a full sync path, i.e. start with localroot->localname
+// walk localpath and return corresponding LocalNode and its parent
+// localpath must be relative to l or start with the root prefix if l == NULL
+// localpath must be a full sync path, i.e. start with localroot->localname
 // NULL: no match, optionally returns residual path
 LocalNode* Sync::localnodebypath(LocalNode* l, const LocalPath& localpath, LocalNode** parent, LocalPath* outpath)
 {
@@ -1161,6 +1262,12 @@ LocalNode* Sync::localnodebypath(LocalNode* l, const LocalPath& localpath, Local
         l = localroot.get();
     }
 
+    if (localpath.empty())
+    {
+        if (outpath) outpath->clear();
+        if (parent) *parent = l->parent;
+        return l;
+    }
 
     LocalPath component;
 
@@ -1279,18 +1386,16 @@ bool Sync::scan(LocalPath* localpath, FileAccess* fa)
 // path references a new FOLDERNODE: returns created node
 // path references a existing FILENODE: returns node
 // otherwise, returns NULL
+// empty input_localpath means to process l rather than a named subitem of l (for scan propagation purposes with folderNeedsRescan flag)
 LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* const localname, dstime *backoffds, bool wejustcreatedthisfolder, DirAccess* iteratingDir)
 {
     LocalNode* ll = l;
     bool newnode = false, changed = false;
     bool isroot;
 
-    LocalNode* parent;
+    LocalNode* parent = nullptr;
     string path;           // UTF-8 representation of tmppath
     LocalPath tmppath;     // full path represented by l + localpath
-    LocalPath newname;     // portion of tmppath not covered by the existing
-                           // LocalNode structure (always the last path component
-                           // that does not have a corresponding LocalNode yet)
 
     if (localname)
     {
@@ -1315,39 +1420,37 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
             tmppath.appendWithSeparator(*input_localpath, false);
         }
 
-        // look up deepest existing LocalNode by path, store remainder (if any)
-        // in newname
+        string name = tmppath.leafName().toPath(*client->fsaccess);
+        path = tmppath.toPath(*client->fsaccess);
+
+        if (!client->app->sync_syncable(this, name.c_str(), tmppath))
+        {
+            LOG_debug << "Excluded: " << path;
+            return NULL;
+        }
+
+        // look up deepest existing LocalNode by path, store remainder (if any) in newname
+
+        LocalPath newname;     // portion of tmppath not covered by the existing
+                               // LocalNode structure (always the last path component
+                               // that does not have a corresponding LocalNode yet)
+
         LocalNode *tmp = localnodebypath(l, *input_localpath, &parent, &newname);
         size_t index = 0;
 
         if (newname.findNextSeparator(index))
         {
-            LOG_warn << "Parent not detected yet. Unknown remainder: " << newname.toPath(*client->fsaccess);
-            if (parent)
-            {
-                LocalPath notifyPath = parent->getLocalPath();
-                notifyPath.appendWithSeparator(newname.subpathTo(index), true);
-                dirnotify->notify(DirNotify::DIREVENTS, l, std::move(notifyPath), true);
-            }
+            LOG_warn << "Parent not detected yet. Remainder: " << newname.toPath(*client->fsaccess);
+            // when (if) the parent is created, we'll rescan the folder
             return NULL;
         }
 
         l = tmp;
 
-        path = tmppath.toPath(*client->fsaccess);
-
         // path invalid?
-        if ( ( !l && newname.empty() ) || !path.size())
+        if ((!l && newname.empty()) || !path.size())
         {
             LOG_warn << "Invalid path: " << path;
-            return NULL;
-        }
-
-        string name = !newname.empty() ? newname.toName(*client->fsaccess, mFilesystemType) : l->name;
-
-        if (!client->app->sync_syncable(this, name.c_str(), tmppath))
-        {
-            LOG_debug << "Excluded: " << path;
             return NULL;
         }
 
@@ -1359,7 +1462,7 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
 
     if (parent)
     {
-        if (state != SYNC_INITIALSCAN && !parent->node)
+        if (state() != SYNC_INITIALSCAN && !parent->node)
         {
             LOG_warn << "Parent doesn't exist yet: " << path;
             return (LocalNode*)~0;
@@ -1412,6 +1515,8 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
                     {
                         localbytes += l->size;
                     }
+
+                    l->needsRescan = false;
 
                     return l;
                 }
@@ -1495,24 +1600,34 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
                                     {
                                         LOG_debug << "File move/overwrite detected";
 
-                                        // delete existing LocalNode...
-                                        delete l;
+                                        if (parent && !parent->node)
+                                        {
+                                            // we can't handle such a move yet, the target cloud node doesn't exist.
+                                            // when it does, we'll rescan that node's local node (ie, this folder)
+                                            LOG_debug << "File move/overwrite detected BUT can't be processed yet - waiting on parent's cloud node creation:" << parent->getLocalPath().toPath();
+                                            return NULL;
+                                        }
+                                        else
+                                        {
+                                            // delete existing LocalNode...
+                                            delete l;
 
-                                        // ...move remote node out of the way...
-                                        client->execsyncdeletions();
+                                            // ...move remote node out of the way...
+                                            client->execsyncdeletions();
 
-                                        // ...and atomically replace with moved one
-                                        client->app->syncupdate_local_move(this, it->second, path.c_str());
+                                            // ...and atomically replace with moved one
+                                            LOG_debug << "Sync - local rename/move " << it->second->getLocalPath().toPath(*client->fsaccess) << " -> " << path;
 
-                                        // (in case of a move, this synchronously updates l->parent and l->node->parent)
-                                        it->second->setnameparent(parent, localpathNew, client->fsaccess->fsShortname(*localpathNew));
+                                            // (in case of a move, this synchronously updates l->parent and l->node->parent)
+                                            it->second->setnameparent(parent, localpathNew, client->fsaccess->fsShortname(*localpathNew));
 
-                                        // mark as seen / undo possible deletion
-                                        it->second->setnotseen(0);
+                                            // mark as seen / undo possible deletion
+                                            it->second->setnotseen(0);
 
-                                        statecacheadd(it->second);
+                                            statecacheadd(it->second);
 
-                                        return it->second;
+                                            return it->second;
+                                        }
                                     }
                                 }
                                 else
@@ -1537,7 +1652,7 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
                                 localbytes -= dsize - l->size;
                             }
 
-                            client->app->syncupdate_local_file_change(this, l, path.c_str());
+                            LOG_debug << "Sync - local file change detected: " << path;
 
                             DBTableTransactionCommitter committer(client->tctable);
                             client->stopxfer(l, &committer); // TODO:  can we use one committer for all the files in the folder?  Or for the whole recursion?
@@ -1716,11 +1831,35 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
                         }
                     }
 
-                    client->app->syncupdate_local_move(this, it->second, path.c_str());
+                    LOG_debug << "Sync - local rename/move " << it->second->getLocalPath().toPath(*client->fsaccess) << " -> " << path.c_str();
 
-                    // (in case of a move, this synchronously updates l->parent
-                    // and l->node->parent)
-                    it->second->setnameparent(parent, localpathNew, client->fsaccess->fsShortname(*localpathNew));
+                    if (parent && !parent->node)
+                    {
+                        // we can't handle such a move yet, the target cloud node doesn't exist.
+                        // when it does, we'll rescan that node's local node (ie, this folder)
+                        LOG_debug << "Move or rename of existing node detected BUT can't be processed yet - waiting on parent's cloud node creation: " << parent->getLocalPath().toPath();
+                        return NULL;
+                    }
+                    else
+                    {
+                        // (in case of a move, this synchronously updates l->parent
+                        // and l->node->parent)
+                        it->second->setnameparent(parent, localpathNew, client->fsaccess->fsShortname(*localpathNew));
+                    }
+
+                    // Has the move (rename) resulted in a filename anomaly?
+                    if (Node* node = it->second->node)
+                    {
+                        auto type = isFilenameAnomaly(*localpathNew, node);
+
+                        if (type != FILENAME_ANOMALY_NONE)
+                        {
+                            auto localPath = localpathNew->toPath();
+                            auto remotePath = node->displaypath();
+
+                            client->filenameAnomalyDetected(type, localPath, remotePath);
+                        }
+                    }
 
                     // make sure that active PUTs receive their updated filenames
                     client->updateputs();
@@ -1730,10 +1869,24 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
                     // unmark possible deletion
                     it->second->setnotseen(0);
 
-                    // immediately scan folder to detect deviations from cached state
-                    if (fullscan && fa->type == FOLDERNODE)
+                    if (fa->type == FOLDERNODE)
                     {
-                        scan(localpathNew, fa.get());
+                        // mark this and folders below to be rescanned
+                        it->second->setSubtreeNeedsRescan(fullscan);
+
+                        if (fullscan)
+                        {
+                            // immediately scan folder to detect deviations from cached state
+                            scan(localpathNew, fa.get());
+
+                            // consider this folder scanned.
+                            it->second->needsRescan = false;
+                        }
+                        else
+                        {
+                            // queue this one to be scanned, recursion is by notify of subdirs
+                            dirnotify->notify(DirNotify::DIREVENTS, it->second, LocalPath(), true);
+                        }
                     }
                 }
                 else if (fa->mIsSymLink)
@@ -1763,14 +1916,19 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
             // detect file changes or recurse into new subfolders
             if (l->type == FOLDERNODE)
             {
-                if (newnode)
+                if (newnode || l->needsRescan)
                 {
                     scan(localpathNew, fa.get());
-                    client->app->syncupdate_local_folder_addition(this, l, path.c_str());
+                    l->needsRescan = false;
 
-                    if (!isroot)
+                    if (newnode)
                     {
-                        statecacheadd(l);
+                        LOG_debug << "Sync - local folder addition detected: " << path;
+
+                        if (!isroot)
+                        {
+                            statecacheadd(l);
+                        }
                     }
                 }
                 else
@@ -1812,14 +1970,16 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
 
                     if (newnode)
                     {
-                        client->app->syncupdate_local_file_addition(this, l, path.c_str());
+                        LOG_debug << "Sync - local file addition detected: " << path;
                     }
                     else if (changed)
                     {
-                        client->app->syncupdate_local_file_change(this, l, path.c_str());
+                        LOG_debug << "Sync - local file change detected: " << path;
                         DBTableTransactionCommitter committer(client->tctable); // TODO:  can we use one committer for all the files in the folder?  Or for the whole recursion?
                         client->stopxfer(l, &committer);
                     }
+
+                    l->needsRescan = false;
 
                     if (newnode || changed)
                     {
@@ -1848,7 +2008,7 @@ LocalNode* Sync::checkpath(LocalNode* l, LocalPath* input_localpath, string* con
             // fopen() signals that the failure is potentially transient - do
             // nothing and request a recheck
             LOG_warn << "File blocked. Adding notification to the retry queue: " << path;
-            dirnotify->notify(DirNotify::RETRY, ll, LocalPath(*localpathNew));
+            dirnotify->notify(DirNotify::RETRY, ll, LocalPath(*input_localpath));
             client->syncfslockretry = true;
             client->syncfslockretrybt.backoff(SCANNING_DELAY_DS);
             client->blockedfile = *localpathNew;
@@ -1904,9 +2064,12 @@ bool Sync::checkValidNotification(int q, Notification& notification)
     if (notification.timestamp && !initializing && q == DirNotify::DIREVENTS)
     {
         LocalPath tmppath;
-        if (notification.localnode)
+
+        if (auto* node = notification.localnode)
         {
-            tmppath = notification.localnode->getLocalPath();
+            if (node == (LocalNode*)~0) return false;
+
+            tmppath = node->getLocalPath();
         }
 
         if (!notification.path.empty())
@@ -1918,8 +2081,11 @@ bool Sync::checkValidNotification(int q, Notification& notification)
         auto fa = client->fsaccess->newfileaccess(false);
         bool success = fa->fopen(tmppath, false, false);
         LocalNode *ll = localnodebypath(notification.localnode, notification.path);
-        if ((!ll && !success && !fa->retry) // deleted file
+        auto deleted = !ll && !success && !fa->retry;
+
+        if (deleted
             || (ll && success && ll->node && ll->node->localnode == ll
+                && !ll->needsRescan
                 && (ll->type != FILENODE || (*(FileFingerprint *)ll) == (*(FileFingerprint *)ll->node))
                 && (ait = ll->node->attrs.map.find('n')) != ll->node->attrs.map.end()
                 && ait->second == ll->name
@@ -2058,7 +2224,7 @@ bool Sync::movetolocaldebris(LocalPath& localpath)
         if (i == -2 || i > 95)
         {
             LOG_verbose << "Creating local debris folder";
-            client->fsaccess->mkdirlocal(localdebris, true);
+            client->fsaccess->mkdirlocal(localdebris, true, false);
         }
 
         sprintf(buf, "%04d-%02d-%02d", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday);
@@ -2074,18 +2240,18 @@ bool Sync::movetolocaldebris(LocalPath& localpath)
         if (i > -3)
         {
             LOG_verbose << "Creating daily local debris folder";
-            havedir = client->fsaccess->mkdirlocal(localdebris, false) || client->fsaccess->target_exists;
+            havedir = client->fsaccess->mkdirlocal(localdebris, false, false) || client->fsaccess->target_exists;
         }
 
         localdebris.appendWithSeparator(localpath.subpathFrom(localpath.getLeafnameByteIndex(*client->fsaccess)), true);
 
-        client->fsaccess->skip_errorreport = i == -3;  // we expect a problem on the first one when the debris folders or debris day folders don't exist yet
+        client->fsaccess->skip_targetexists_errorreport = i == -3;  // we expect a problem on the first one when the debris folders or debris day folders don't exist yet
         if (client->fsaccess->renamelocal(localpath, localdebris, false))
         {
-            client->fsaccess->skip_errorreport = false;
+            client->fsaccess->skip_targetexists_errorreport = false;
             return true;
         }
-        client->fsaccess->skip_errorreport = false;
+        client->fsaccess->skip_targetexists_errorreport = false;
 
         if (client->fsaccess->transient_error)
         {
@@ -2130,8 +2296,8 @@ m_off_t Sync::getInflightProgress()
 }
 
 
-UnifiedSync::UnifiedSync(MegaClient& mc, const SyncConfig& c)
-    : mClient(mc), mConfig(c)
+UnifiedSync::UnifiedSync(Syncs& s, const SyncConfig& c)
+    : syncs(s), mClient(s.mClient), mConfig(c)
 {
     mNextHeartbeat.reset(new HeartBeatSyncInfo());
 }
@@ -2149,9 +2315,9 @@ error UnifiedSync::enableSync(bool resetFingerprint, bool notifyApp)
 
     LocalPath rootpath;
     std::unique_ptr<FileAccess> openedLocalFolder;
-    Node* remotenode;
+    string remotenodename;
     bool inshare, isnetwork;
-    error e = mClient.checkSyncConfig(mConfig, rootpath, openedLocalFolder, remotenode, inshare, isnetwork);
+    error e = mClient.checkSyncConfig(mConfig, rootpath, openedLocalFolder, remotenodename, inshare, isnetwork);
 
     if (e)
     {
@@ -2160,7 +2326,7 @@ error UnifiedSync::enableSync(bool resetFingerprint, bool notifyApp)
         return e;
     }
 
-    e = startSync(&mClient, DEBRISFOLDER, nullptr, remotenode, inshare, isnetwork, rootpath, openedLocalFolder);
+    e = startSync(&mClient, DEBRISFOLDER, nullptr, mConfig.mRemoteNode, inshare, isnetwork, rootpath, openedLocalFolder);
     mClient.syncactivity = true;
     changedConfigState(notifyApp);
 
@@ -2175,23 +2341,23 @@ bool UnifiedSync::updateSyncRemoteLocation(Node* n, bool forceCallback)
     if (n)
     {
         auto newpath = n->displaypath();
-        if (newpath != mConfig.mOrigninalPathOfRemoteRootNode)
+        if (newpath != mConfig.mOriginalPathOfRemoteRootNode)
         {
-            mConfig.mOrigninalPathOfRemoteRootNode = newpath;
+            mConfig.mOriginalPathOfRemoteRootNode = newpath;
             changed = true;
         }
 
         if (mConfig.getRemoteNode() != n->nodehandle)
         {
-            mConfig.setRemoteNode(n->nodehandle);
+            mConfig.setRemoteNode(NodeHandle().set6byte(n->nodehandle));
             changed = true;
         }
     }
     else //unset remote node: failed!
     {
-        if (mConfig.getRemoteNode() != UNDEF)
+        if (!mConfig.getRemoteNode().isUndef())
         {
-            mConfig.setRemoteNode(UNDEF);
+            mConfig.setRemoteNode(NodeHandle());
             changed = true;
         }
     }
@@ -2209,40 +2375,17 @@ bool UnifiedSync::updateSyncRemoteLocation(Node* n, bool forceCallback)
 
 
 
-error UnifiedSync::startSync(MegaClient* client, const char* debris, LocalPath* localdebris, Node* remotenode, bool inshare,
-                             bool isNetwork, LocalPath& rootpath, std::unique_ptr<FileAccess>& openedLocalFolder)
+error UnifiedSync::startSync(MegaClient* client, const char* debris, LocalPath* localdebris,
+    NodeHandle rootNodeHandle, bool inshare, bool isNetwork, LocalPath& rootpath,
+    std::unique_ptr<FileAccess>& openedLocalFolder)
 {
-    //check we are not in any blocking situation
-    using CType = CacheableStatus::Type;
-    bool overStorage = client->mCachedStatus.lookup(CType::STATUS_STORAGE, STORAGE_UNKNOWN) >= STORAGE_RED;
-    bool businessExpired = client->mCachedStatus.lookup(CType::STATUS_BUSINESS, BIZ_STATUS_UNKNOWN) == BIZ_STATUS_EXPIRED;
-    bool blocked = client->mCachedStatus.lookup(CType::STATUS_BLOCKED, 0) == 1;
-
-    mConfig.mError = NO_SYNC_ERROR;
-    mConfig.mEnabled = true;
-
-    // the order is important here: a user needs to resolve blocked in order to resolve storage
-    if (overStorage)
-    {
-        mConfig.mError = STORAGE_OVERQUOTA;
-    }
-    else if (businessExpired)
-    {
-        mConfig.mError = BUSINESS_EXPIRED;
-    }
-    else if (blocked)
-    {
-        mConfig.mError = ACCOUNT_BLOCKED;
-    }
-
-    if (mConfig.mError)
-    {
-        // save configuration but avoid creating active sync, and set as temporary disabled:
-        mClient.syncs.saveSyncConfig(mConfig);
-        return API_EFAILED;
-    }
-
     auto prevFingerprint = mConfig.getLocalFingerprint();
+
+    Node* remotenode = client->nodeByHandle(rootNodeHandle);
+    if (!remotenode)
+    {
+        return API_EEXIST;
+    }
 
     assert(!mSync);
     mSync.reset(new Sync(*this, debris, localdebris, remotenode, inshare));
@@ -2304,7 +2447,7 @@ void UnifiedSync::changedConfigState(bool notifyApp)
         mClient.syncs.saveSyncConfig(mConfig);
         if (notifyApp)
         {
-            mClient.app->syncupdate_stateconfig(mConfig.getBackupId());
+            mClient.app->syncupdate_stateconfig(mConfig);
         }
         mClient.abortbackoff(false);
     }
@@ -2313,121 +2456,10 @@ void UnifiedSync::changedConfigState(bool notifyApp)
 Syncs::Syncs(MegaClient& mc)
   : mClient(mc)
 {
-    mHeartBeatMonitor.reset(new BackupMonitor(&mClient));
+    mHeartBeatMonitor.reset(new BackupMonitor(*this));
 }
 
-error Syncs::backupAdd(const SyncConfig& config,
-                       SyncCompletionFunction completion,
-                       const bool delayInitialScan)
-{
-    // Is the config valid?
-    if (config.mExternalDrivePath.empty()
-        || config.mLocalPath.empty()
-        || config.mOrigninalPathOfRemoteRootNode.empty()
-        || config.mRemoteNode == UNDEF
-        || config.mSyncType != SyncConfig::TYPE_BACKUP)
-    {
-        if (completion)
-        {
-            completion(nullptr, NO_SYNC_ERROR, API_EARGS);
-        }
-
-        return API_EARGS;
-    }
-
-    // For convenience.
-    auto& fsAccess = *mClient.fsaccess;
-    auto& name = config.mName;
-    auto& sourcePath = config.mLocalPath;
-    auto drivePath = NormalizeAbsolute(config.mExternalDrivePath);
-
-    // Is the source actually contained on the drive?
-    if (!drivePath.isContainingPathOf(sourcePath))
-    {
-        if (completion)
-        {
-            completion(nullptr, NO_SYNC_ERROR, API_EARGS);
-        }
-
-        return API_EARGS;
-    }
-
-    // Could we get our hands on the config store?
-    auto* store = syncConfigStore();
-
-    if (!store)
-    {
-        LOG_verbose << "Unable to add backup "
-                    << sourcePath.toPath(fsAccess)
-                    << " on "
-                    << drivePath.toPath(fsAccess)
-                    << " as there is no config store.";
-
-        if (completion)
-        {
-            completion(nullptr, NO_SYNC_ERROR, API_EINTERNAL);
-        }
-
-        // Nope and we can't do anything without it.
-        return API_EINTERNAL;
-    }
-
-    if (store->driveKnown(drivePath))
-    {
-        // Try and restore any backups on this drive
-        backupRestore(drivePath);
-    }
-
-    if (!store->driveKnown(drivePath))
-    {
-        // Couldn't create (or open) the database.
-        LOG_verbose << "Unable to add backup "
-                    << sourcePath.toPath(fsAccess)
-                    << " on "
-                    << drivePath.toPath(fsAccess)
-                    << " as we could not open it's config database.";
-
-        if (completion)
-        {
-            completion(nullptr, NO_SYNC_ERROR, API_EFAILED);
-        }
-
-        return API_EFAILED;
-    }
-
-    // Make sure this backup's tag is unique.
-    if (syncConfigByBackupId(config.mBackupId))
-    {
-        LOG_verbose << "Unable to add backup "
-                    << sourcePath.toPath(fsAccess)
-                    << " on "
-                    << drivePath.toPath(fsAccess)
-                    << " as a sync already exists with the backup ID "
-                    << toHandle(config.mBackupId);
-
-        if (completion)
-        {
-            completion(nullptr, NO_SYNC_ERROR, API_EEXIST);
-        }
-
-        return API_EEXIST;
-    }
-
-    SyncConfig syncConfig(config);
-
-    syncConfig.mExternalDrivePath = std::move(drivePath);
-    syncConfig.mLocalPath =
-      NormalizeAbsolute(syncConfig.mLocalPath);
-
-    if (sourcePath.toPath(fsAccess) == name)
-    {
-        syncConfig.mName = syncConfig.mLocalPath.toPath(fsAccess);
-    }
-
-    return mClient.addsync(syncConfig, true, completion);
-}
-
-SyncConfigVector Syncs::configsForDrive(const LocalPath& drive)
+SyncConfigVector Syncs::configsForDrive(const LocalPath& drive) const
 {
     SyncConfigVector v;
     for (auto& s : mSyncVec)
@@ -2440,7 +2472,7 @@ SyncConfigVector Syncs::configsForDrive(const LocalPath& drive)
     return v;
 }
 
-SyncConfigVector Syncs::allConfigs()
+SyncConfigVector Syncs::allConfigs() const
 {
     SyncConfigVector v;
     for (auto& s : mSyncVec)
@@ -2450,7 +2482,7 @@ SyncConfigVector Syncs::allConfigs()
     return v;
 }
 
-error Syncs::backupRemove(LocalPath drivePath)
+error Syncs::backupCloseDrive(LocalPath drivePath)
 {
     // Is the path valid?
     if (drivePath.empty())
@@ -2470,60 +2502,25 @@ error Syncs::backupRemove(LocalPath drivePath)
     // Ensure the drive path is in normalized form.
     drivePath = NormalizeAbsolute(drivePath);
 
-    removeSelectedSyncs([drivePath](SyncConfig& config, Sync*){
-        return config.mExternalDrivePath == drivePath;
-    });
-
-    return store->write(drivePath, configsForDrive(drivePath));
-}
-
-
-error Syncs::backupRestore(const LocalPath& drivePath,
-                           const SyncConfigVector& configs)
-{
-    // Convenience.
-    auto& fsAccess = *mClient.fsaccess;
-
-    LOG_verbose << "Attempting to restore backup syncs from "
-                << drivePath.toPath(fsAccess);
-
-    size_t numRestored = 0;
-
-    // Create a unified sync for each backup config.
-    for (const auto& config : configs)
+    // Is this drive actually loaded?
+    if (!store->driveKnown(drivePath))
     {
-        // Make sure there aren't any syncs with this tag.
-        if (syncConfigByBackupId(config.mBackupId))
-        {
-            LOG_verbose << "Skipping restore of backup "
-                        << config.mLocalPath.toPath(fsAccess)
-                        << " on "
-                        << drivePath.toPath(fsAccess)
-                        << " as a sync already exists with the backup id "
-                        << toHandle(config.mBackupId);
-
-            continue;
-        }
-
-        // Create the unified sync.
-        mSyncVec.emplace_back(new UnifiedSync(mClient, config));
-
-        // Track how many configs we've restored.
-        ++numRestored;
+        return API_ENOENT;
     }
 
-    // Log how many backups we could restore.
-    LOG_verbose << "Restored "
-                << numRestored
-                << " out of "
-                << configs.size()
-                << " backup(s) from "
-                << drivePath.toPath(fsAccess);
+    auto result = store->write(drivePath, configsForDrive(drivePath));
+    store->removeDrive(drivePath);
 
-    return API_OK;
+    unloadSelectedSyncs(
+      [&](SyncConfig& config, Sync*)
+      {
+          return config.mExternalDrivePath == drivePath;
+      });
+
+    return result;
 }
 
-error Syncs::backupRestore(LocalPath drivePath)
+error Syncs::backupOpenDrive(LocalPath drivePath)
 {
     // Is the drive path valid?
     if (drivePath.empty())
@@ -2539,9 +2536,9 @@ error Syncs::backupRestore(LocalPath drivePath)
 
     if (!store)
     {
-        LOG_verbose << "Couldn't restore "
-                    << drivePath.toPath(fsAccess)
-                    << " as there is no config store.";
+        LOG_err << "Couldn't restore "
+                << drivePath.toPath(fsAccess)
+                << " as there is no config store.";
 
         // Nope and we can't do anything without it.
         return API_EINTERNAL;
@@ -2553,29 +2550,75 @@ error Syncs::backupRestore(LocalPath drivePath)
     // Has this drive already been opened?
     if (store->driveKnown(drivePath))
     {
-        LOG_verbose << "Skipped restore of "
-                    << drivePath.toPath(fsAccess)
-                    << " as it has already been opened.";
+        LOG_debug << "Skipped restore of "
+                  << drivePath.toPath(fsAccess)
+                  << " as it has already been opened.";
 
         // Then we don't have to do anything.
         return API_EEXIST;
     }
 
-    // Try and open the database on the drive.
     SyncConfigVector configs;
 
-    if (store->read(drivePath, configs) == API_OK)
+    // Try and open the database on the drive.
+    auto result = store->read(drivePath, configs);
+
+    // Try and restore the backups in the database.
+    if (result == API_OK)
     {
-        // Try and restore the backups in the database.
-        return backupRestore(drivePath, configs);
+        LOG_debug << "Attempting to restore backup syncs from "
+                  << drivePath.toPath(fsAccess);
+
+        size_t numRestored = 0;
+
+        // Create a unified sync for each backup config.
+        for (auto& config : configs)
+        {
+            lock_guard<mutex> g(mSyncVecMutex);
+
+            bool skip = false;
+            for (auto& us : mSyncVec)
+            {
+                // Make sure there aren't any syncs with this backup id.
+                if (config.mBackupId == us->mConfig.mBackupId)
+                {
+				    skip = true;
+                    LOG_err << "Skipping restore of backup "
+                            << config.mLocalPath.toPath(fsAccess)
+                            << " on "
+                            << drivePath.toPath(fsAccess)
+                            << " as a sync already exists with the backup id "
+                            << toHandle(config.mBackupId);
+                }
+            }
+
+            if (!skip)
+            {
+                // Create the unified sync.
+                mSyncVec.emplace_back(new UnifiedSync(*this, config));
+
+                // Track how many configs we've restored.
+                ++numRestored;
+            }
+        }
+
+        // Log how many backups we could restore.
+        LOG_debug << "Restored "
+                  << numRestored
+                  << " out of "
+                  << configs.size()
+                  << " backup(s) from "
+                  << drivePath.toPath(fsAccess);
+
+        return API_OK;
     }
 
     // Couldn't open the database.
-    LOG_verbose << "Failed to restore "
-                << drivePath.toPath(fsAccess)
-                << " as we couldn't open its config database.";
+    LOG_warn << "Failed to restore "
+             << drivePath.toPath(fsAccess)
+             << " as we couldn't open its config database.";
 
-    return API_EREAD;
+    return result;
 }
 
 SyncConfigStore* Syncs::syncConfigStore()
@@ -2611,19 +2654,117 @@ SyncConfigStore* Syncs::syncConfigStore()
     return mSyncConfigStore.get();
 }
 
+error Syncs::syncConfigStoreAdd(const SyncConfig& config)
+{
+    // Convenience.
+    static auto equal =
+      [](const LocalPath& lhs, const LocalPath& rhs)
+      {
+          return !platformCompareUtf(lhs, false, rhs, false);
+      };
+
+    auto* store = syncConfigStore();
+
+    // Could we get our hands on the store?
+    if (!store)
+    {
+        // Nope and we can't proceed without it.
+        return API_EINTERNAL;
+    }
+
+    SyncConfigVector configs;
+    bool known = store->driveKnown(LocalPath());
+
+    // Load current configs from disk.
+    auto result = store->read(LocalPath(), configs);
+
+    if (result == API_ENOENT || result == API_OK)
+    {
+        SyncConfigVector::iterator i = configs.begin();
+
+        // Are there any syncs already present for this root?
+        for ( ; i != configs.end(); ++i)
+        {
+            if (equal(i->mLocalPath, config.mLocalPath))
+            {
+                break;
+            }
+        }
+
+        // Did we find any existing config?
+        if (i != configs.end())
+        {
+            // Yep, replace it.
+            LOG_debug << "Replacing existing sync config for: "
+                      << i->mLocalPath.toPath();
+
+            *i = config;
+        }
+        else
+        {
+            // Nope, add it.
+            configs.emplace_back(config);
+        }
+
+        // Write the configs to disk.
+        result = store->write(LocalPath(), configs);
+    }
+
+    // Remove the drive if it wasn't already known.
+    if (!known)
+    {
+        store->removeDrive(LocalPath());
+    }
+
+    return result;
+}
+
 bool Syncs::syncConfigStoreDirty()
 {
     return mSyncConfigStore && mSyncConfigStore->dirty();
 }
 
-void Syncs::syncConfigStoreFlush()
+bool Syncs::syncConfigStoreFlush()
 {
     // No need to flush if the store's not dirty.
-    if (syncConfigStoreDirty())
-    {
-        LOG_verbose << "Flushing config store changes.";
-        mSyncConfigStore->writeDirtyDrives(allConfigs());
-    }
+    if (!syncConfigStoreDirty()) return true;
+
+    // Try and flush changes to disk.
+    LOG_debug << "Attempting to flush config store changes.";
+
+    auto failed = mSyncConfigStore->writeDirtyDrives(allConfigs());
+
+    if (failed.empty()) return true;
+
+    LOG_err << "Failed to flush "
+             << failed.size()
+             << " drive(s).";
+
+    // Disable syncs present on drives that we couldn't write.
+    size_t nFailed = failed.size();
+
+    disableSelectedSyncs(
+        [&](SyncConfig& config, Sync*)
+        {
+            // But only if they're not already disabled.
+            if (!config.getEnabled()) return false;
+
+            auto matched = failed.count(config.mExternalDrivePath);
+
+            return matched > 0;
+        },
+        false,
+        SYNC_CONFIG_WRITE_FAILURE,
+        false,
+        [=](size_t disabled){
+            LOG_warn << "Disabled "
+                << disabled
+                << " sync(s) on "
+                << nFailed
+                << " drive(s).";
+        });
+
+    return false;
 }
 
 error Syncs::syncConfigStoreLoad(SyncConfigVector& configs)
@@ -2638,7 +2779,7 @@ error Syncs::syncConfigStoreLoad(SyncConfigVector& configs)
         // Try and read the internal database from disk.
         result = store->read(LocalPath(), configs);
 
-        if (result == API_OK)
+        if (result == API_ENOENT || result == API_OK)
         {
             LOG_debug << "Loaded "
                       << configs.size()
@@ -2652,6 +2793,478 @@ error Syncs::syncConfigStoreLoad(SyncConfigVector& configs)
             << result;
 
     return result;
+}
+
+string Syncs::exportSyncConfigs(const SyncConfigVector configs) const
+{
+    JSONWriter writer;
+
+    writer.beginobject();
+    writer.beginarray("configs");
+
+    for (const auto& config : configs)
+    {
+        exportSyncConfig(writer, config);
+    }
+
+    writer.endarray();
+    writer.endobject();
+
+    return writer.getstring();
+}
+
+string Syncs::exportSyncConfigs() const
+{
+    return exportSyncConfigs(configsForDrive(LocalPath()));
+}
+
+void Syncs::importSyncConfigs(const char* data, std::function<void(error)> completion)
+{
+    // Convenience.
+    struct Context;
+
+    using CompletionFunction = std::function<void(error)>;
+    using ContextPtr = std::shared_ptr<Context>;
+
+    // Bundles state we need to create backup IDs.
+    struct Context
+    {
+        static void put(ContextPtr context)
+        {
+            using std::bind;
+            using std::move;
+            using std::placeholders::_1;
+            using std::placeholders::_2;
+
+            // Convenience.
+            auto& client = *context->mClient;
+            auto& config = *context->mConfig;
+            auto& deviceHash = context->mDeviceHash;
+
+            // Backup Info.
+            auto state = BackupInfoSync::getSyncState(config, context->mSyncs->mDownloadsPaused, context->mSyncs->mUploadsPaused);
+            auto info  = BackupInfoSync(config, deviceHash, UNDEF, state);
+
+            LOG_debug << "Generating backup ID for config "
+                      << context->signature()
+                      << "...";
+
+            // Completion chain.
+            auto completion = bind(&putComplete, move(context), _1, _2);
+
+            // Create and initiate request.
+            auto* request = new CommandBackupPut(&client, info, move(completion));
+            client.reqs.add(request);
+        }
+
+        static void putComplete(ContextPtr context, Error result, handle backupID)
+        {
+            // No backup ID even though the request succeeded?
+            if (!result && ISUNDEF(result))
+            {
+                // Then we've encountered an internal error.
+                result = API_EINTERNAL;
+            }
+
+            // Convenience;
+            auto& client = *context->mClient;
+
+            // Were we able to create a backup ID?
+            if (result)
+            {
+                LOG_err << "Unable to generate backup ID for config "
+                        << context->signature();
+
+                auto i = context->mConfigs.begin();
+                auto j = context->mConfig;
+
+                // Remove the IDs we've created so far.
+                LOG_debug << "Releasing backup IDs generated so far...";
+
+                for ( ; i != j; ++i)
+                {
+                    auto* request = new CommandBackupRemove(&client, i->mBackupId);
+                    client.reqs.add(request);
+                }
+
+                // Let the client know the import has failed.
+                context->mCompletion(result);
+                return;
+            }
+
+            // Assign the newly generated backup ID.
+            context->mConfig->mBackupId = backupID;
+
+            // Have we assigned IDs for all the syncs?
+            if (++context->mConfig == context->mConfigs.end())
+            {
+                auto& syncs = *context->mSyncs;
+
+                LOG_debug << context->mConfigs.size()
+                          << " backup ID(s) have been generated.";
+
+                LOG_debug << "Importing "
+                          << context->mConfigs.size()
+                          << " configs(s)...";
+
+                // Yep, add them to the sync.
+                for (const auto& config : context->mConfigs)
+                {
+                    syncs.appendNewSync(config, client);
+                }
+
+                LOG_debug << context->mConfigs.size()
+                          << " sync(s) imported successfully.";
+
+                // Let the client know the import has completed.
+                context->mCompletion(API_OK);
+                return;
+            }
+
+            // Generate an ID for the next config.
+            put(std::move(context));
+        }
+
+        string signature() const
+        {
+            ostringstream ostream;
+
+            ostream << mConfig - mConfigs.begin() + 1
+                    << "/"
+                    << mConfigs.size();
+
+            return ostream.str();
+        }
+
+        // Client.
+        MegaClient* mClient;
+
+        // Who to call back when we're done.
+        CompletionFunction mCompletion;
+
+        // Next config requiring a backup ID.
+        SyncConfigVector::iterator mConfig;
+
+        // Configs requiring a backup ID.
+        SyncConfigVector mConfigs;
+
+        // Identifies the device we're adding configs to.
+        string mDeviceHash;
+
+        // Who we're adding the configs to.
+        Syncs* mSyncs;
+    }; // Context
+
+    // Sanity.
+    if (!data || !*data)
+    {
+        completion(API_EARGS);
+        return;
+    }
+
+    // Try and translate JSON back into sync configs.
+    SyncConfigVector configs;
+
+    if (!importSyncConfigs(data, configs))
+    {
+        // No love. Inform the client.
+        completion(API_EREAD);
+        return;
+    }
+
+    // Create and initialize context.
+    ContextPtr context = make_unique<Context>();
+
+    context->mClient = &mClient;
+    context->mCompletion = std::move(completion);
+    context->mConfigs = std::move(configs);
+    context->mConfig = context->mConfigs.begin();
+    context->mDeviceHash = mClient.getDeviceidHash();
+    context->mSyncs = this;
+
+    LOG_debug << "Attempting to generate backup IDs for "
+              << context->mConfigs.size()
+              << " imported config(s)...";
+
+    // Generate backup IDs.
+    Context::put(std::move(context));
+}
+
+void Syncs::exportSyncConfig(JSONWriter& writer, const SyncConfig& config) const
+{
+    // Internal configs only for the time being.
+    if (!config.mExternalDrivePath.empty())
+    {
+        LOG_warn << "Skipping export of external backup: "
+                 << config.mLocalPath.toPath();
+        return;
+    }
+
+    const auto& fsAccess = *mClient.fsaccess;
+
+    string localPath = config.mLocalPath.toPath(fsAccess);
+    string remotePath;
+    const string& name = config.mName;
+    const char* type = SyncConfig::synctypename(config.mSyncType);
+
+    if (const auto* node = mClient.nodeByHandle(config.mRemoteNode))
+    {
+        // Get an accurate remote path, if possible.
+        remotePath = node->displaypath();
+    }
+    else
+    {
+        // Otherwise settle for what we had stored.
+        remotePath = config.mOriginalPathOfRemoteRootNode;
+    }
+
+#ifdef _WIN32
+    // Skip namespace prefix.
+    if (!localPath.compare("\\\\?\\"))
+    {
+        localPath.erase(0, 4);
+    }
+#endif // _WIN32
+
+    writer.beginobject();
+    writer.arg_stringWithEscapes("localPath", localPath);
+    writer.arg_stringWithEscapes("name", name);
+    writer.arg_stringWithEscapes("remotePath", remotePath);
+    writer.arg_stringWithEscapes("type", type);
+    writer.endobject();
+}
+
+bool Syncs::importSyncConfig(JSON& reader, SyncConfig& config)
+{
+    static const string TYPE_LOCAL_PATH  = "localPath";
+    static const string TYPE_NAME        = "name";
+    static const string TYPE_REMOTE_PATH = "remotePath";
+    static const string TYPE_TYPE        = "type";
+
+    LOG_debug << "Attempting to parse config object: "
+              << reader.pos;
+
+    string localPath;
+    string name;
+    string remotePath;
+    string type;
+
+    // Parse config properties.
+    for (string key; ; )
+    {
+        // What property are we parsing?
+        key = reader.getname();
+
+        // Have we processed all the properties?
+        if (key.empty()) break;
+
+        string value;
+
+        // Extract property value if we can.
+        if (!reader.storeobject(&value))
+        {
+            LOG_err << "Parse error extracting property: "
+                    << key
+                    << ": "
+                    << reader.pos;
+
+            return false;
+        }
+
+        if (key == TYPE_LOCAL_PATH)
+        {
+            localPath = std::move(value);
+        }
+        else if (key == TYPE_NAME)
+        {
+            name = std::move(value);
+        }
+        else if (key == TYPE_REMOTE_PATH)
+        {
+            remotePath = std::move(value);
+        }
+        else if (key == TYPE_TYPE)
+        {
+            type = std::move(value);
+        }
+        else
+        {
+            LOG_debug << "Skipping unknown property: "
+                      << key
+                      << ": "
+                      << value;
+        }
+    }
+
+    // Basic validation on properties.
+    if (localPath.empty())
+    {
+        LOG_err << "Invalid config: no local path defined.";
+        return false;
+    }
+
+    if (name.empty())
+    {
+        LOG_err << "Invalid config: no name defined.";
+        return false;
+    }
+
+    if (remotePath.empty())
+    {
+        LOG_err << "Invalid config: no remote path defined.";
+        return false;
+    }
+
+    reader.unescape(&localPath);
+    reader.unescape(&name);
+    reader.unescape(&remotePath);
+    reader.unescape(&type);
+
+    // Populate config object.
+    config.mBackupId = UNDEF;
+    config.mBackupState = SYNC_BACKUP_NONE;
+    config.mEnabled = false;
+    config.mError = NO_SYNC_ERROR;
+    config.mLocalFingerprint = 0;
+    config.mLocalPath = LocalPath::fromPath(localPath, *mClient.fsaccess);
+    config.mName = std::move(name);
+    config.mOriginalPathOfRemoteRootNode = remotePath;
+    config.mWarning = NO_SYNC_WARNING;
+
+    // Set node handle if possible.
+    if (const auto* root = mClient.nodeByPath(remotePath.c_str()))
+    {
+        config.mRemoteNode = root->nodeHandle();
+    }
+    else
+    {
+        LOG_err << "Invalid config: "
+                << "unable to find node for remote path: "
+                << remotePath;
+
+        return false;
+    }
+
+    // Set type.
+    if (!config.synctypefromname(type, config.mSyncType))
+    {
+        LOG_err << "Invalid config: "
+                << "unknown sync type name: "
+                << type;
+
+        return false;
+    }
+
+    // Config's been parsed.
+    LOG_debug << "Config successfully parsed.";
+
+    return true;
+}
+
+bool Syncs::importSyncConfigs(const char* data, SyncConfigVector& configs)
+{
+    static const string TYPE_CONFIGS = "configs";
+
+    JSON reader(data);
+
+    LOG_debug << "Attempting to import configs from: "
+              << data;
+
+    // Enter configs object.
+    if (!reader.enterobject())
+    {
+        LOG_err << "Parse error entering root object: "
+                << reader.pos;
+
+        return false;
+    }
+
+    // Parse sync configs.
+    for (string key; ; )
+    {
+        // What property are we parsing?
+        key = reader.getname();
+
+        // Is it a property we know about?
+        if (key != TYPE_CONFIGS)
+        {
+            // Have we hit the end of the configs object?
+            if (key.empty()) break;
+
+            // Skip unknown properties.
+            string object;
+
+            if (!reader.storeobject(&object))
+            {
+                LOG_err << "Parse error skipping unknown property: "
+                        << key
+                        << ": "
+                        << reader.pos;
+
+                return false;
+            }
+
+            LOG_debug << "Skipping unknown property: "
+                      << key
+                      << ": "
+                      << object;
+
+            // Parse the next property.
+            continue;
+        }
+
+        LOG_debug << "Found configs property: "
+                  << reader.pos;
+
+        // Enter array of sync configs.
+        if (!reader.enterarray())
+        {
+            LOG_err << "Parse error entering configs array: "
+                    << reader.pos;
+
+            return false;
+        }
+
+        // Parse each sync config object.
+        while (reader.enterobject())
+        {
+            SyncConfig config;
+
+            // Try and parse this sync config object.
+            if (!importSyncConfig(reader, config)) return false;
+
+            if (!reader.leaveobject())
+            {
+                LOG_err << "Parse error leaving config object: "
+                        << reader.pos;
+                return false;
+            }
+
+            configs.emplace_back(std::move(config));
+        }
+
+        if (!reader.leavearray())
+        {
+            LOG_err << "Parse error leaving configs array: "
+                    << reader.pos;
+
+            return false;
+        }
+
+        LOG_debug << configs.size()
+                  << " config(s) successfully parsed.";
+    }
+
+    // Leave configs object.
+    if (!reader.leaveobject())
+    {
+        LOG_err << "Parse error leaving root object: "
+                << reader.pos;
+
+        return false;
+    }
+
+    return true;
 }
 
 SyncConfigIOContext* Syncs::syncConfigIOContext()
@@ -2695,13 +3308,13 @@ SyncConfigIOContext* Syncs::syncConfigIOContext()
     constexpr size_t KEYLENGTH = SymmCipher::KEYLENGTH;
 
     // Verify payload contents.
-    auto authKey = store->get("ak");
-    auto cipherKey = store->get("ck");
-    auto name = store->get("fn");
+    string authKey;
+    string cipherKey;
+    string name;
 
-    if (authKey.size() != KEYLENGTH
-        || cipherKey.size() != KEYLENGTH
-        || name.size() != KEYLENGTH)
+    if (!store->get("ak", authKey) || authKey.size() != KEYLENGTH ||
+        !store->get("ck", cipherKey) || cipherKey.size() != KEYLENGTH ||
+        !store->get("fn", name) || name.size() != KEYLENGTH)
     {
         // Payload is malformed.
         LOG_err << "syncConfigIOContext: JSON config data is incomplete";
@@ -2730,34 +3343,30 @@ void Syncs::clear()
     isEmpty = true;
 }
 
-error Syncs::truncate()
-{
-    if (!mSyncConfigStore)
-    {
-        return API_OK;
-    }
-
-    // Remove internal syncs.
-    removeSelectedSyncs(
-        [](SyncConfig& config, Sync*)
-        {
-            return !config.isExternal();
-        });
-
-    // Truncate internal database.
-    return mSyncConfigStore->write(LocalPath(), SyncConfigVector());
-}
-
 void Syncs::resetSyncConfigStore()
 {
     mSyncConfigStore.reset();
     static_cast<void>(syncConfigStore());
 }
 
+vector<NodeHandle> Syncs::getSyncRootHandles(bool mustBeActive)
+{
+    vector<NodeHandle> v;
+    for (auto& s : mSyncVec)
+    {
+        if (mustBeActive && (!s->mSync || !s->mSync->active()))
+        {
+            continue;
+        }
+        v.emplace_back(s->mConfig.mRemoteNode);
+    }
+    return v;
+}
+
 auto Syncs::appendNewSync(const SyncConfig& c, MegaClient& mc) -> UnifiedSync*
 {
     isEmpty = false;
-    mSyncVec.push_back(unique_ptr<UnifiedSync>(new UnifiedSync(mc, c)));
+    mSyncVec.push_back(unique_ptr<UnifiedSync>(new UnifiedSync(*this, c)));
 
     saveSyncConfig(c);
 
@@ -2776,17 +3385,31 @@ Sync* Syncs::runningSyncByBackupId(handle backupId) const
     return nullptr;
 }
 
-SyncConfig* Syncs::syncConfigByBackupId(handle backupId) const
+bool Syncs::syncConfigByBackupId(handle backupId, SyncConfig& c) const
 {
+    // returns a copy for thread safety
+
+    lock_guard<mutex> g(mSyncVecMutex);
     for (auto& s : mSyncVec)
     {
         if (s->mConfig.getBackupId() == backupId)
         {
-            return &s->mConfig;
+            c = s->mConfig;
+
+            // double check we updated fsfp_t
+            if (s->mSync)
+            {
+                assert(c.mLocalFingerprint == s->mSync->fsfp);
+
+                // just in case, for now
+                c.mLocalFingerprint = s->mSync->fsfp;
+            }
+
+            return true;
         }
     }
 
-    return nullptr;
+    return false;
 }
 
 void Syncs::forEachUnifiedSync(std::function<void(UnifiedSync&)> f)
@@ -2794,6 +3417,19 @@ void Syncs::forEachUnifiedSync(std::function<void(UnifiedSync&)> f)
     for (auto& s : mSyncVec)
     {
         f(*s);
+    }
+}
+
+void Syncs::transferPauseFlagsUpdated(bool downloadsPaused, bool uploadsPaused)
+{
+    lock_guard<mutex> g(mSyncVecMutex);
+
+    mDownloadsPaused = downloadsPaused;
+    mUploadsPaused = uploadsPaused;
+
+    for (auto& us : mSyncVec)
+    {
+        mHeartBeatMonitor->updateOrRegisterSync(*us);
     }
 }
 
@@ -2884,9 +3520,9 @@ void Syncs::stopCancelledFailedDisabled()
     for (auto& unifiedSync : mSyncVec)
     {
         if (unifiedSync->mSync && (
-            unifiedSync->mSync->state == SYNC_CANCELED ||
-            unifiedSync->mSync->state == SYNC_FAILED ||
-            unifiedSync->mSync->state == SYNC_DISABLED))
+            unifiedSync->mSync->state() == SYNC_CANCELED ||
+            unifiedSync->mSync->state() == SYNC_FAILED ||
+            unifiedSync->mSync->state() == SYNC_DISABLED))
         {
             unifiedSync->mSync.reset();
         }
@@ -2910,45 +3546,71 @@ void Syncs::purgeRunningSyncs()
     }
 }
 
-void Syncs::disableSyncs(SyncError syncError, bool newEnabledFlag)
+void Syncs::renameSync(handle backupId, const string& newname, std::function<void(Error e)> completion)
 {
-    bool anySyncDisabled = false;
-    disableSelectedSyncs([&](SyncConfig&, Sync* s){
-
-        if (s)
-        {
-            anySyncDisabled = true;
-            return true;
-        }
-        return false;
-    }, syncError, newEnabledFlag);
-
-    if (anySyncDisabled)
+    for (auto &i : mSyncVec)
     {
-        LOG_info << "Disabled syncs. error = " << syncError;
-        mClient.app->syncs_disabled(syncError);
+        if (i->mConfig.mBackupId == backupId)
+        {
+            i->mConfig.mName = newname;
+
+            // cause an immediate `sp` command to update the backup/sync heartbeat master record
+            mHeartBeatMonitor->updateOrRegisterSync(*i);
+
+            // queue saving the change locally
+            if (mSyncConfigStore) mSyncConfigStore->markDriveDirty(i->mConfig.mExternalDrivePath);
+
+            completion(API_OK);
+            return;
+        }
     }
+
+    completion(API_EEXIST);
 }
 
-void Syncs::disableSelectedSyncs(std::function<bool(SyncConfig&, Sync*)> selector, SyncError syncError, bool newEnabledFlag)
+void Syncs::disableSyncs(SyncError syncError, bool newEnabledFlag)
 {
+    disableSelectedSyncs([&](SyncConfig& config, Sync*)
+        {
+            return config.getEnabled();
+        },
+        false,
+        syncError,
+        newEnabledFlag,
+        [=](size_t nDisabled) {
+            LOG_info << "Disabled " << nDisabled << " syncs. error = " << syncError;
+            if (nDisabled) mClient.app->syncs_disabled(syncError);
+        });
+}
+
+void Syncs::disableSelectedSyncs(std::function<bool(SyncConfig&, Sync*)> selector, bool disableIsFail, SyncError syncError, bool newEnabledFlag, std::function<void(size_t)> completion)
+{
+    size_t nDisabled = 0;
     for (auto i = mSyncVec.size(); i--; )
     {
-        if (selector(mSyncVec[i]->mConfig, mSyncVec[i]->mSync.get()))
+        auto& us = *mSyncVec[i];
+        auto& config = us.mConfig;
+        auto* sync = us.mSync.get();
+
+        if (selector(config, sync))
         {
-            if (auto sync = mSyncVec[i]->mSync.get())
+            if (sync)
             {
-                sync->changestate(SYNC_DISABLED, syncError, newEnabledFlag, true); //This will cause the later deletion of Sync (not MegaSyncPrivate) object
+                sync->changestate(disableIsFail ? SYNC_FAILED : SYNC_DISABLED, syncError, newEnabledFlag, true); //This will cause the later deletion of Sync (not MegaSyncPrivate) object
                 mClient.syncactivity = true;
             }
             else
             {
-                mSyncVec[i]->mConfig.setError(syncError);
-                mSyncVec[i]->mConfig.setEnabled(newEnabledFlag);
-                mSyncVec[i]->changedConfigState(true);
+                config.setError(syncError);
+                config.setEnabled(config.isInternal() && newEnabledFlag);
+                us.changedConfigState(true);
             }
+            nDisabled += 1;
+
+            mHeartBeatMonitor->updateOrRegisterSync(*mSyncVec[i]);
         }
     }
+    if (completion) completion(nDisabled);
 }
 
 void Syncs::removeSelectedSyncs(std::function<bool(SyncConfig&, Sync*)> selector)
@@ -2962,6 +3624,39 @@ void Syncs::removeSelectedSyncs(std::function<bool(SyncConfig&, Sync*)> selector
     }
 }
 
+void Syncs::unloadSelectedSyncs(std::function<bool(SyncConfig&, Sync*)> selector)
+{
+    for (auto i = mSyncVec.size(); i--; )
+    {
+        if (selector(mSyncVec[i]->mConfig, mSyncVec[i]->mSync.get()))
+        {
+            unloadSyncByIndex(i);
+        }
+    }
+}
+
+void Syncs::purgeSyncs()
+{
+    if (!mSyncConfigStore) return;
+
+    // Remove all syncs.
+    removeSelectedSyncs([](SyncConfig&, Sync*) { return true; });
+
+    // Truncate internal sync config database.
+    mSyncConfigStore->write(LocalPath(), SyncConfigVector());
+
+    // Remove all drives.
+    for (auto& drive : mSyncConfigStore->knownDrives())
+    {
+        // Never remove internal drive.
+        if (!drive.empty())
+        {
+            // This does not flush.
+            mSyncConfigStore->removeDrive(drive);
+        }
+    }
+}
+
 void Syncs::removeSyncByIndex(size_t index)
 {
     if (index < mSyncVec.size())
@@ -2969,25 +3664,45 @@ void Syncs::removeSyncByIndex(size_t index)
         if (auto& syncPtr = mSyncVec[index]->mSync)
         {
             syncPtr->changestate(SYNC_CANCELED, UNKNOWN_ERROR, false, false);
-
-            if (syncPtr->statecachetable)
-            {
-                syncPtr->statecachetable->remove();
-                delete syncPtr->statecachetable;
-                syncPtr->statecachetable = NULL;
-            }
+            assert(!syncPtr->statecachetable);
             syncPtr.reset(); // deletes sync
         }
 
         mSyncConfigStore->markDriveDirty(mSyncVec[index]->mConfig.mExternalDrivePath);
 
         // call back before actual removal (intermediate layer may need to make a temp copy to call client app)
-        auto backupId = mSyncVec[index]->mConfig.getBackupId();
-        mClient.app->sync_removed(backupId);
+        auto& config = mSyncVec[index]->mConfig;
+        mClient.app->sync_removed(config);
+
+        // unregister this sync/backup from API (backup center)
+        mClient.reqs.add(new CommandBackupRemove(&mClient, config.getBackupId()));
 
         mClient.syncactivity = true;
         mSyncVec.erase(mSyncVec.begin() + index);
 
+        isEmpty = mSyncVec.empty();
+    }
+}
+
+void Syncs::unloadSyncByIndex(size_t index)
+{
+    if (index < mSyncVec.size())
+    {
+        if (auto& syncPtr = mSyncVec[index]->mSync)
+        {
+            // if it was running, the app gets a callback saying it's no longer active
+            // SYNC_CANCELED is a special value that means we are shutting it down without changing config
+            syncPtr->changestate(SYNC_CANCELED, UNKNOWN_ERROR, false, false);
+            assert(!syncPtr->statecachetable);
+            syncPtr.reset(); // deletes sync
+        }
+
+        // the sync config is not affected by this operation; it should already be up to date on disk (or be pending)
+        // we don't call sync_removed back since the sync is not deleted
+        // we don't unregister from the backup/sync heartbeats as the sync can be resumed later
+
+        mClient.syncactivity = true;
+        mSyncVec.erase(mSyncVec.begin() + index);
         isEmpty = mSyncVec.empty();
     }
 }
@@ -3017,47 +3732,6 @@ void Syncs::saveSyncConfig(const SyncConfig& config)
     }
 }
 
-// restore all configured syncs that were in a temporary error state (not manually disabled)
-void Syncs::enableResumeableSyncs()
-{
-    bool anySyncRestored = false;
-
-    for (auto& unifiedSync : mSyncVec)
-    {
-        if (!unifiedSync->mSync)
-        {
-            if (unifiedSync->mConfig.getEnabled())
-            {
-                SyncError syncError = unifiedSync->mConfig.getError();
-                LOG_debug << "Restoring sync: " << toHandle(unifiedSync->mConfig.getBackupId()) << " " << unifiedSync->mConfig.getLocalPath().toPath(*mClient.fsaccess) << " fsfp= " << unifiedSync->mConfig.getLocalFingerprint() << " old error = " << syncError;
-
-                error e = unifiedSync->enableSync(false, true);
-                if (!e)
-                {
-                    // Only internal backups can be resumed.
-                    if (unifiedSync->mSync->isBackup())
-                    {
-                        // And they should come up in the MONITOR state.
-                        unifiedSync->mSync->backupMonitor();
-                    }
-
-                    anySyncRestored = true;
-                }
-            }
-            else
-            {
-                LOG_verbose << "Skipping restoring sync: " << unifiedSync->mConfig.getLocalPath().toPath(*mClient.fsaccess)
-                    << " enabled=" << unifiedSync->mConfig.getEnabled() << " error=" << unifiedSync->mConfig.getError();
-            }
-        }
-    }
-
-    if (anySyncRestored)
-    {
-        mClient.app->syncs_restored();
-    }
-}
-
 void Syncs::resumeResumableSyncsOnStartup()
 {
     if (mClient.loggedin() != FULLACCOUNT) return;
@@ -3074,7 +3748,7 @@ void Syncs::resumeResumableSyncsOnStartup()
 
     for (auto& config : configs)
     {
-        mSyncVec.push_back(unique_ptr<UnifiedSync>(new UnifiedSync(mClient, config)));
+        mSyncVec.push_back(unique_ptr<UnifiedSync>(new UnifiedSync(*this, config)));
         isEmpty = false;
     }
 
@@ -3082,44 +3756,48 @@ void Syncs::resumeResumableSyncsOnStartup()
     {
         if (!unifiedSync->mSync)
         {
-            if (unifiedSync->mConfig.mOrigninalPathOfRemoteRootNode.empty()) //should only happen if coming from old cache
+            if (unifiedSync->mConfig.mOriginalPathOfRemoteRootNode.empty()) //should only happen if coming from old cache
             {
-                auto node = mClient.nodebyhandle(unifiedSync->mConfig.getRemoteNode());
+                auto node = mClient.nodeByHandle(unifiedSync->mConfig.getRemoteNode());
                 unifiedSync->updateSyncRemoteLocation(node, false); //updates cache & notice app of this change
                 if (node)
                 {
                     auto newpath = node->displaypath();
-                    unifiedSync->mConfig.mOrigninalPathOfRemoteRootNode = newpath;//update loaded config
+                    unifiedSync->mConfig.mOriginalPathOfRemoteRootNode = newpath;//update loaded config
                 }
             }
 
+            bool hadAnError = unifiedSync->mConfig.getError() != NO_SYNC_ERROR;
+
             if (unifiedSync->mConfig.getEnabled())
             {
+                // Right now, syncs are disabled upon all errors but, after sync-rework, syncs
+                // could be kept as enabled but failed due to a temporary/recoverable error and
+                // the SDK may auto-resume them if the error condition vanishes
+                // (ie. an expired business account automatically disable syncs, but once
+                // the user has paid, we may auto-resume).
+                // TODO: remove assertion if it no longer applies:
+                assert(!hadAnError);
+
 #ifdef __APPLE__
                 unifiedSync->mConfig.setLocalFingerprint(0); //for certain MacOS, fsfp seems to vary when restarting. we set it to 0, so that it gets recalculated
 #endif
                 LOG_debug << "Resuming cached sync: " << toHandle(unifiedSync->mConfig.getBackupId()) << " " << unifiedSync->mConfig.getLocalPath().toPath(*mClient.fsaccess) << " fsfp= " << unifiedSync->mConfig.getLocalFingerprint() << " error = " << unifiedSync->mConfig.getError();
 
-                if (!unifiedSync->enableSync(false, false))
-                {
-                    // Only internal backups can be resumed.
-                    if (unifiedSync->mSync->isBackup())
-                    {
-                        // And they should come up in the MONITOR state.
-                        unifiedSync->mSync->backupMonitor();
-                    }
-                }
+                unifiedSync->enableSync(false, false);
                 LOG_debug << "Sync autoresumed: " << toHandle(unifiedSync->mConfig.getBackupId()) << " " << unifiedSync->mConfig.getLocalPath().toPath(*mClient.fsaccess) << " fsfp= " << unifiedSync->mConfig.getLocalFingerprint() << " error = " << unifiedSync->mConfig.getError();
 
-                mClient.app->sync_auto_resume_result(*unifiedSync, true);
+                mClient.app->sync_auto_resume_result(unifiedSync->mConfig, true, hadAnError);
             }
             else
             {
                 LOG_debug << "Sync loaded (but not resumed): " << toHandle(unifiedSync->mConfig.getBackupId()) << " " << unifiedSync->mConfig.getLocalPath().toPath(*mClient.fsaccess) << " fsfp= " << unifiedSync->mConfig.getLocalFingerprint() << " error = " << unifiedSync->mConfig.getError();
-                mClient.app->sync_auto_resume_result(*unifiedSync, false);
+                mClient.app->sync_auto_resume_result(unifiedSync->mConfig, false, hadAnError);
             }
         }
     }
+
+    mClient.app->syncs_restored();
 }
 
 
@@ -3149,14 +3827,11 @@ SyncConfigStore::~SyncConfigStore()
 
 void SyncConfigStore::markDriveDirty(const LocalPath& drivePath)
 {
-    auto i = mKnownDrives.find(drivePath);
-    if (i != mKnownDrives.end())
-    {
-        i->second.dirty = true;
-    }
+    // Drive should be known.
+    assert(mKnownDrives.count(drivePath));
+
+    mKnownDrives[drivePath].dirty = true;
 }
-
-
 
 bool SyncConfigStore::equal(const LocalPath& lhs, const LocalPath& rhs) const
 {
@@ -3191,10 +3866,22 @@ bool SyncConfigStore::driveKnown(const LocalPath& drivePath) const
     return mKnownDrives.count(drivePath) > 0;
 }
 
+vector<LocalPath> SyncConfigStore::knownDrives() const
+{
+    vector<LocalPath> result;
 
+    for (auto& i : mKnownDrives)
+    {
+        result.emplace_back(i.first);
+    }
 
+    return result;
+}
 
-
+bool SyncConfigStore::removeDrive(const LocalPath& drivePath)
+{
+    return mKnownDrives.erase(drivePath) > 0;
+}
 
 error SyncConfigStore::read(const LocalPath& drivePath, SyncConfigVector& configs)
 {
@@ -3203,22 +3890,29 @@ error SyncConfigStore::read(const LocalPath& drivePath, SyncConfigVector& config
     driveInfo.drivePath = drivePath;
 
     vector<unsigned int> confSlots;
-    if (mIOContext.getSlotsInOrder(driveInfo.dbPath, confSlots) != API_OK)
-    {
-        return API_ENOENT;
-    }
 
-    for (const auto& slot : confSlots)
+    auto result = mIOContext.getSlotsInOrder(driveInfo.dbPath, confSlots);
+
+    if (result == API_OK)
     {
-        if (read(driveInfo, configs, slot) == API_OK)
+        for (const auto& slot : confSlots)
         {
-            driveInfo.slot = (slot + 1) % NUM_CONFIG_SLOTS;
-            mKnownDrives[drivePath] = driveInfo;
-            return API_OK;
+            result = read(driveInfo, configs, slot);
+
+            if (result == API_OK)
+            {
+                driveInfo.slot = (slot + 1) % NUM_CONFIG_SLOTS;
+                break;
+            }
         }
     }
 
-    return API_EREAD;
+    if (result != API_EREAD)
+    {
+        mKnownDrives[drivePath] = driveInfo;
+    }
+
+    return result;
 }
 
 
@@ -3229,24 +3923,22 @@ error SyncConfigStore::write(const LocalPath& drivePath, const SyncConfigVector&
         assert(equal(config.mExternalDrivePath, drivePath));
     }
 
-    if (mKnownDrives.find(drivePath) == mKnownDrives.end())
-    {
-        mKnownDrives[drivePath].dbPath = dbPath(drivePath);
-        mKnownDrives[drivePath].drivePath = drivePath;
-    }
+    // Drive should already be known.
+    assert(mKnownDrives.count(drivePath));
+
     auto& drive = mKnownDrives[drivePath];
+
+    // Always mark drives as clean.
+    // This is to avoid us attempting to flush a failing drive forever.
+    drive.dirty = false;
 
     if (configs.empty())
     {
-        error e = mIOContext.remove(drivePath);
-        if (!e)
-        {
-            drive.dirty = false;
-        }
-        else
+        error e = mIOContext.remove(drive.dbPath);
+        if (e)
         {
             LOG_warn << "Unable to remove sync configs at: "
-                << drivePath.toPath() << " error " << e;
+                     << drivePath.toPath() << " error " << e;
         }
         return e;
     }
@@ -3262,14 +3954,15 @@ error SyncConfigStore::write(const LocalPath& drivePath, const SyncConfigVector&
         if (e)
         {
             LOG_warn << "Unable to write sync configs at: "
-                << drivePath.toPath() << " error " << e;
+                     << drivePath.toPath() << " error " << e;
 
             return API_EWRITE;
         }
 
+        // start using a different slot (a different file)
         drive.slot = (drive.slot + 1) % NUM_CONFIG_SLOTS;
-        drive.dirty = false;
 
+        // remove the existing slot (if any), since it is obsolete now
         mIOContext.remove(drive.dbPath, drive.slot);
 
         return API_OK;
@@ -3277,7 +3970,7 @@ error SyncConfigStore::write(const LocalPath& drivePath, const SyncConfigVector&
 }
 
 
-error SyncConfigStore::read(DriveInfo& driveInfo, SyncConfigVector& configs, 
+error SyncConfigStore::read(DriveInfo& driveInfo, SyncConfigVector& configs,
                              unsigned int slot)
 {
     const auto& dbPath = driveInfo.dbPath;
@@ -3296,51 +3989,54 @@ error SyncConfigStore::read(DriveInfo& driveInfo, SyncConfigVector& configs,
     }
 
     const auto& drivePath = driveInfo.drivePath;
-    auto& fsAccess = mIOContext.fsAccess();
 
     for (auto& config : configs)
     {
         config.mExternalDrivePath = drivePath;
 
-        auto sourcePath = config.mLocalPath.toPath(fsAccess);
-
         if (!drivePath.empty())
         {
             config.mLocalPath.prependWithSeparator(drivePath);
-        }
-
-        if (sourcePath == config.mName)
-        {
-            config.mName = config.mLocalPath.toPath(fsAccess);
         }
     }
 
     return API_OK;
 }
 
-void SyncConfigStore::writeDirtyDrives(const SyncConfigVector& configs)
+auto SyncConfigStore::writeDirtyDrives(const SyncConfigVector& configs) -> DriveSet
 {
+    DriveSet failed;
+
     for (auto& d : mKnownDrives)
     {
-        if (d.second.dirty)
+        if (!d.second.dirty) continue;
+
+        const auto& drivePath = d.second.drivePath;
+
+        SyncConfigVector v;
+
+        for (auto& c : configs)
         {
-            SyncConfigVector v;
-            for (auto& c : configs)
+            if (c.mExternalDrivePath == drivePath)
             {
-                if (c.mExternalDrivePath == d.second.drivePath)
-                {
-                    v.push_back(c);
-                }
-            }
-            error e = write(d.second.drivePath, v);
-            if (e)
-            {
-                LOG_err << "Could not write sync configs at " << d.second.drivePath.toPath() << " error " << e;
+                v.push_back(c);
             }
         }
-    }
-}
 
+        error e = write(drivePath, v);
+        if (e)
+        {
+            LOG_err << "Could not write sync configs at "
+                    << drivePath.toPath()
+                    << " error "
+                    << e;
+
+            failed.emplace(drivePath);
+        }
+    }
+
+    return failed;
+}
 
 
 const string SyncConfigIOContext::NAME_PREFIX = "megaclient_syncconfig_";
@@ -3561,8 +4257,8 @@ error SyncConfigIOContext::read(const LocalPath& dbPath,
     if (!fileAccess->fopen(path, true, false))
     {
         // Couldn't open the file for reading.
-        LOG_debug << "Unable to open config DB for reading: "
-                  << path.toPath(mFsAccess);
+        LOG_err << "Unable to open config DB for reading: "
+                << path.toPath(mFsAccess);
 
         return API_EREAD;
     }
@@ -3573,8 +4269,8 @@ error SyncConfigIOContext::read(const LocalPath& dbPath,
     if (!fileAccess->fread(&d, static_cast<unsigned>(fileAccess->size), 0, 0x0))
     {
         // Couldn't read the file.
-        LOG_debug << "Unable to read config DB: "
-                  << path.toPath(mFsAccess);
+        LOG_err << "Unable to read config DB: "
+                << path.toPath(mFsAccess);
 
         return API_EREAD;
     }
@@ -3583,8 +4279,8 @@ error SyncConfigIOContext::read(const LocalPath& dbPath,
     if (!decrypt(d, data))
     {
         // Couldn't decrypt the data.
-        LOG_debug << "Unable to decrypt config DB: "
-                  << path.toPath(mFsAccess);
+        LOG_err << "Unable to decrypt config DB: "
+                << path.toPath(mFsAccess);
 
         return API_EREAD;
     }
@@ -3636,7 +4332,7 @@ error SyncConfigIOContext::remove(const LocalPath& dbPath)
     return result ? API_OK : API_EWRITE;
 }
 
-void SyncConfigIOContext::serialize(const vector<SyncConfig>& configs,
+void SyncConfigIOContext::serialize(const SyncConfigVector& configs,
                                     JSONWriter& writer) const
 {
     writer.beginobject();
@@ -3663,10 +4359,10 @@ error SyncConfigIOContext::write(const LocalPath& dbPath,
               << slot;
 
     // Try and create the backup configuration directory.
-    if (!(mFsAccess.mkdirlocal(path) || mFsAccess.target_exists))
+    if (!(mFsAccess.mkdirlocal(path, false, true) || mFsAccess.target_exists))
     {
-        LOG_debug << "Unable to create config DB directory: "
-                  << dbPath.toPath(mFsAccess);
+        LOG_err << "Unable to create config DB directory: "
+                << dbPath.toPath(mFsAccess);
 
         // Couldn't create the directory and it doesn't exist.
         return API_EWRITE;
@@ -3681,8 +4377,8 @@ error SyncConfigIOContext::write(const LocalPath& dbPath,
     if (!fileAccess->fopen(path, false, true))
     {
         // Couldn't open the file for writing.
-        LOG_debug << "Unable to open config DB for writing: "
-                  << path.toPath(mFsAccess);
+        LOG_err << "Unable to open config DB for writing: "
+                << path.toPath(mFsAccess);
 
         return API_EWRITE;
     }
@@ -3691,8 +4387,8 @@ error SyncConfigIOContext::write(const LocalPath& dbPath,
     if (!fileAccess->ftruncate())
     {
         // Couldn't truncate the file.
-        LOG_debug << "Unable to truncate config DB: "
-                  << path.toPath(mFsAccess);
+        LOG_err << "Unable to truncate config DB: "
+                << path.toPath(mFsAccess);
 
         return API_EWRITE;
     }
@@ -3706,8 +4402,8 @@ error SyncConfigIOContext::write(const LocalPath& dbPath,
     if (!fileAccess->fwrite(bytes, static_cast<unsigned>(d.size()), 0x0))
     {
         // Couldn't write out the data.
-        LOG_debug << "Unable to write config DB: "
-                  << path.toPath(mFsAccess);
+        LOG_err << "Unable to write config DB: "
+                << path.toPath(mFsAccess);
 
         return API_EWRITE;
     }
@@ -3773,6 +4469,7 @@ bool SyncConfigIOContext::decrypt(const string& in, string& out)
 bool SyncConfigIOContext::deserialize(SyncConfig& config, JSON& reader) const
 {
     const auto TYPE_BACKUP_ID       = MAKENAMEID2('i', 'd');
+    const auto TYPE_BACKUP_STATE    = MAKENAMEID2('b', 's');
     const auto TYPE_ENABLED         = MAKENAMEID2('e', 'n');
     const auto TYPE_FINGERPRINT     = MAKENAMEID2('f', 'p');
     const auto TYPE_LAST_ERROR      = MAKENAMEID2('l', 'e');
@@ -3782,7 +4479,6 @@ bool SyncConfigIOContext::deserialize(SyncConfig& config, JSON& reader) const
     const auto TYPE_SYNC_TYPE       = MAKENAMEID2('s', 't');
     const auto TYPE_TARGET_HANDLE   = MAKENAMEID2('t', 'h');
     const auto TYPE_TARGET_PATH     = MAKENAMEID2('t', 'p');
-    const auto TYPE_EXCLUSION_RULES = MAKENAMEID2('e', 'r');
 
     for ( ; ; )
     {
@@ -3835,30 +4531,18 @@ bool SyncConfigIOContext::deserialize(SyncConfig& config, JSON& reader) const
             config.mBackupId = reader.gethandle(sizeof(handle));
             break;
 
+        case TYPE_BACKUP_STATE:
+            config.mBackupState =
+              static_cast<SyncBackupState>(reader.getint32());
+            break;
+
         case TYPE_TARGET_HANDLE:
-            config.mRemoteNode = reader.gethandle(MegaClient::NODEHANDLE);
-            if ((config.mRemoteNode & 0xFFFFFFFFFFFF) == (UNDEF & 0xFFFFFFFFFFFF))
-            {
-                // we can have a much nicer solution when NodeHandle is merged from the sync rework branch
-                config.mRemoteNode = UNDEF;
-            }
+            config.mRemoteNode = reader.getNodeHandle();
             break;
 
         case TYPE_TARGET_PATH:
-            reader.storebinary(&config.mOrigninalPathOfRemoteRootNode);
+            reader.storebinary(&config.mOriginalPathOfRemoteRootNode);
             break;
-
-        case TYPE_EXCLUSION_RULES:
-        {
-            if (!reader.enterarray()) return false;
-            string s;
-            while (reader.storeobject(&s))
-            {
-                config.mRegExps.push_back(Base64::atob(s));
-            }
-            if (!reader.leavearray()) return false;
-            break;
-        }
 
         default:
             if (!reader.storeobject())
@@ -3901,40 +4585,27 @@ string SyncConfigIOContext::encrypt(const string& data)
 void SyncConfigIOContext::serialize(const SyncConfig& config,
                                     JSONWriter& writer) const
 {
-    auto drivePath =
-      config.mExternalDrivePath.toPath(mFsAccess);
-    auto sourcePath =
-      config.mLocalPath.toPath(mFsAccess);
-    auto* name = &config.mName;
-
-    // Compute effective name.
-    if (*name == sourcePath)
-    {
-        name = &sourcePath;
-    }
+    auto sourcePath = config.mLocalPath.toPath(mFsAccess);
 
     // Strip drive path from source.
-    sourcePath.erase(0, drivePath.size());
+    if (config.isExternal())
+    {
+        auto drivePath = config.mExternalDrivePath.toPath(mFsAccess);
+        sourcePath.erase(0, drivePath.size());
+    }
 
     writer.beginobject();
     writer.arg("id", config.getBackupId(), sizeof(handle));
     writer.arg_B64("sp", sourcePath);
-    writer.arg_B64("n", *name);
-    writer.arg_B64("tp", config.mOrigninalPathOfRemoteRootNode);
+    writer.arg_B64("n", config.mName);
+    writer.arg_B64("tp", config.mOriginalPathOfRemoteRootNode);
     writer.arg_fsfp("fp", config.mLocalFingerprint);
-    writer.arg("th", config.mRemoteNode, MegaClient::NODEHANDLE);
+    writer.arg("th", config.mRemoteNode);
     writer.arg("le", config.mError);
     writer.arg("lw", config.mWarning);
     writer.arg("st", config.mSyncType);
     writer.arg("en", config.mEnabled);
-
-    writer.beginarray("er");
-    for (auto& s : config.mRegExps)
-    {
-        // store as binary so the strings get btoa'd so no JSON injections
-        writer.element_B64(s);
-    }
-    writer.endarray();
+    writer.arg("bs", config.mBackupState);
     writer.endobject();
 }
 

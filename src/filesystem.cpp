@@ -26,6 +26,8 @@
 
 #include "megafs.h"
 
+#include <cassert>
+
 namespace mega {
 
 namespace detail {
@@ -254,13 +256,10 @@ LocalPath NormalizeRelative(const LocalPath& path)
 }
 
 FileSystemAccess::FileSystemAccess()
-    : waiter(NULL)
-    , skip_errorreport(false)
-    , transient_error(false)
-    , notifyerr(false)
+#ifdef ENABLE_SYNC
+    : notifyerr(false)
     , notifyfailed(false)
-    , target_exists(false)
-    , client(NULL)
+#endif
 {
 }
 
@@ -478,7 +477,7 @@ void FileSystemAccess::normalize(string* filename)
     *filename = std::move(result);
 }
 
-std::unique_ptr<LocalPath> FileSystemAccess::fsShortname(LocalPath& localname)
+std::unique_ptr<LocalPath> FileSystemAccess::fsShortname(const LocalPath& localname)
 {
     LocalPath s;
     if (getsname(localname, s))
@@ -488,16 +487,19 @@ std::unique_ptr<LocalPath> FileSystemAccess::fsShortname(LocalPath& localname)
     return nullptr;
 }
 
+#ifdef ENABLE_SYNC
+
 // default DirNotify: no notification available
-DirNotify::DirNotify(const LocalPath& clocalbasepath, const LocalPath& cignore)
+DirNotify::DirNotify(const LocalPath& clocalbasepath, const LocalPath& cignore, Sync* s)
 {
+    assert(!clocalbasepath.empty());
     localbasepath = clocalbasepath;
     ignore = cignore;
 
     mFailed = 1;
     mFailReason = "Not initialized";
     mErrorCount = 0;
-    sync = NULL;
+    sync = s;
 }
 
 
@@ -537,10 +539,7 @@ void DirNotify::notify(notifyqueue q, LocalNode* l, LocalPath&& path, bool immed
     // We may be executing on a thread here so we can't access the LocalNode data structures.  Queue everything, and
     // filter when the notifications are processed.  Also, queueing it here is faster than logging the decision anyway.
 
-    Notification n;
-    n.timestamp = immediate ? 0 : Waiter::ds;
-    n.localnode = l;
-    n.path = std::move(path);
+    Notification n(immediate ? 0 : Waiter::ds, std::move(path), l);
     notifyq[q].pushBack(std::move(n));
 
 #ifdef ENABLE_SYNC
@@ -563,10 +562,12 @@ bool DirNotify::fsstableids() const
     return true;
 }
 
-DirNotify* FileSystemAccess::newdirnotify(LocalPath& localpath, LocalPath& ignore, Waiter*)
+DirNotify* FileSystemAccess::newdirnotify(const LocalPath& localpath, const LocalPath& ignore, Waiter*, LocalNode* syncroot)
 {
-    return new DirNotify(localpath, ignore);
+    return new DirNotify(localpath, ignore, syncroot->sync);
 }
+
+#endif  // ENABLE_SYNC
 
 FileAccess::FileAccess(Waiter *waiter)
 {
@@ -984,7 +985,7 @@ void LocalPath::appendWithSeparator(const LocalPath& additionalPath, bool separa
     if (separatorAlways || localpath.size())
     {
         // still have to be careful about appending a \ to F:\ for example, on windows, which produces an invalid path
-        if (!endsInSeparator())
+        if (!(endsInSeparator() || additionalPath.beginsWithSeparator()))
         {
             localpath.append(1, localPathSeparator);
         }
@@ -999,13 +1000,19 @@ void LocalPath::prependWithSeparator(const LocalPath& additionalPath)
     if (!localpath.empty() && localpath[0] != localPathSeparator)
     {
         // no additional separator if there is already one before
-
-        if (!additionalPath.endsInSeparator())
+        if (!(beginsWithSeparator() || additionalPath.endsInSeparator()))
         {
             localpath.insert(0, 1, localPathSeparator);
         }
     }
     localpath.insert(0, additionalPath.localpath);
+}
+
+LocalPath LocalPath::prependNewWithSeparator(const LocalPath& additionalPath) const
+{
+    LocalPath lp = *this;
+    lp.prependWithSeparator(additionalPath);
+    return lp;
 }
 
 void LocalPath::trimNonDriveTrailingSeparator()
@@ -1174,6 +1181,12 @@ LocalPath LocalPath::fromPlatformEncoded(wstring&& wpath)
     p.localpath = std::move(wpath);
     return p;
 }
+
+wchar_t LocalPath::driveLetter()
+{
+    auto drivepos = localpath.find(L':');
+    return drivepos == wstring::npos || drivepos < 1 ? 0 : localpath[drivepos-1];
+}
 #endif
 
 
@@ -1245,6 +1258,36 @@ ScopedLengthRestore::~ScopedLengthRestore()
 {
     path.localpath.resize(length);
 };
+
+FilenameAnomalyType isFilenameAnomaly(const LocalPath& localPath, const string& remoteName, nodetype_t type)
+{
+    auto localName = localPath.leafName().toPath();
+
+    if (localName != remoteName)
+    {
+        return FILENAME_ANOMALY_NAME_MISMATCH;
+    }
+    else if (isReservedName(remoteName, type))
+    {
+        return FILENAME_ANOMALY_NAME_RESERVED;
+    }
+
+    return FILENAME_ANOMALY_NONE;
+}
+
+FilenameAnomalyType isFilenameAnomaly(const LocalPath& localPath, const Node* node)
+{
+    assert(node);
+
+    return isFilenameAnomaly(localPath, node->displayname(), node->type);
+}
+
+#ifdef ENABLE_SYNC
+FilenameAnomalyType isFilenameAnomaly(const LocalNode& node)
+{
+    return isFilenameAnomaly(node.localname, node.name, node.type);
+}
+#endif
 
 } // namespace
 

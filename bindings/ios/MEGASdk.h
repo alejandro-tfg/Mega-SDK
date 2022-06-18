@@ -68,8 +68,6 @@ typedef NS_ENUM (NSInteger, MEGASortOrderType) {
     MEGASortOrderTypeCreationDesc,
     MEGASortOrderTypeModificationAsc,
     MEGASortOrderTypeModificationDesc,
-    MEGASortOrderTypeAlphabeticalAsc,
-    MEGASortOrderTypeAlphabeticalDesc,
     MEGASortOrderTypePhotoAsc,
     MEGASortOrderTypePhotoDesc,
     MEGASortOrderTypeVideoAsc,
@@ -270,6 +268,14 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
     BackupHeartbeatStatusUnknown = 5
 };
 
+typedef NS_ENUM(NSInteger, AccountActionType) {
+    AccountActionTypeCreate = 0,
+    AccountActionTypeResume = 1,
+    AccountActionTypeCancel = 2,
+    AccountActionTypeCreateEphemeralPlusPlus = 3,
+    AccountActionTypeResumeEphemeralPlusPlus = 4,
+};
+
 /**
  * @brief Allows to control a MEGA account or a public folder.
  *
@@ -391,15 +397,13 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * Function related to statistics will be reviewed in future updates to
  * provide more data and avoid race conditions. They could change or be removed in the current form.
  */
-@property (readonly, nonatomic) NSNumber *totalsDownloadBytes __attribute__((deprecated("They could change or be removed in the current form.")));
+@property (readonly, nonatomic) NSNumber *totalsDownloadBytes;
 
 /**
  * @brief Total downloaded bytes since the creation of the MEGASdk object.
  *
- * @deprecated Property related to statistics will be reviewed in future updates to
- * provide more data and avoid race conditions. They could change or be removed in the current form.
  */
-@property (readonly, nonatomic) NSNumber *totalsDownloadedBytes __attribute__((deprecated("They could change or be removed in the current form.")));
+@property (readonly, nonatomic) NSNumber *totalsDownloadedBytes;
 
 /**
  * Get the total bytes of started uploads
@@ -412,16 +416,13 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * provide more data and avoid race conditions. They could change or be removed in the current form.
  *
  */
-@property (readonly, nonatomic) NSNumber *totalsUploadBytes __attribute__((deprecated("They could change or be removed in the current form.")));
+@property (readonly, nonatomic) NSNumber *totalsUploadBytes;
 
 /**
  * @brief Total uploaded bytes since the creation of the MEGASdk object.
  *
- * @deprecated Property related to statistics will be reviewed in future updates to
- * provide more data and avoid race conditions. They could change or be removed in the current form.
- *
  */
-@property (readonly, nonatomic) NSNumber *totalsUploadedBytes __attribute__((deprecated("They could change or be removed in the current form.")));
+@property (readonly, nonatomic) NSNumber *totalsUploadedBytes;
 
 /**
  * @brief The total number of nodes in the account
@@ -561,6 +562,11 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  *
  */
 - (nullable instancetype)initWithAppKey:(NSString *)appKey userAgent:(nullable NSString *)userAgent basePath:(nullable NSString *)basePath;
+
+/**
+ * @brief Delete MegaApi object
+ */
+- (void)deleteMegaApi;
 
 #pragma mark - Add and remove delegates
 
@@ -1175,6 +1181,9 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  */
 - (void)fastLoginWithSession:(NSString *)session delegate:(id<MEGARequestDelegate>)delegate;
 
+- (void)fastLoginWithSessionOffline:(NSString *)session delegate:(id<MEGARequestDelegate>)delegate;
+
+
 /**
  * @brief Log in to a MEGA account using a session key.
  *
@@ -1201,6 +1210,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * @param delegate Delegate to track this request.
  */
 - (void)loginToFolderLink:(NSString *)folderLink delegate:(id<MEGARequestDelegate>)delegate;
+- (void)loginToFolderLinkAuthed:(NSString *)folderLink folderAuth:(NSString *)folderAuth offline:(BOOL)offline delegate:(id<MEGARequestDelegate>)delegate;
 
 /**
  * @brief Log in to a public folder using a folder link.
@@ -1267,7 +1277,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  *
  * @return Current session key.
  */
-- (nullable NSString *)dumpSession;
+- (nullable NSString *)dumpSession:(BOOL)offline;
 
 /**
  * @brief Returns the current sequence number
@@ -1281,10 +1291,46 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
 - (nullable NSString *)sequenceNumber;
 
 /**
+ * @brief Get an authentication token that can be used to identify the user account
+ *
+ * If this MEGASdk object is not logged into an account, this function will return nil
+ *
+ * The value returned by this function can be used in other instances of MEGASdk
+ * thanks to the function [MEGASdk setAccountAuth].
+ *
+ * @return Authentication token
+ */
+- (nullable NSString *)accountAuth;
+
+/**
+ * @brief Use an authentication token to identify an account while accessing public folders
+ *
+ * This function is useful to preserve the PRO status when a public folder is being
+ * used. The identifier will be sent in all API requests made after the call to this function.
+ *
+ * To stop using the current authentication token, it's needed to explicitly call
+ * this function with nil as parameter. Otherwise, the value set would continue
+ * being used despite this MEGASdk object is logged in or logged out.
+ *
+ * It's recommended to call this function before the usage of [MEGASdk loginToFolder]
+ *
+ * @param accountAuth Authentication token used to identify the account of the user.
+ * You can get it using [MEGASdk accountAuth] with an instance of MEGASdk logged into
+ * an account.
+ */
+- (void)setAccountAuth:(nullable NSString *)accountAuth;
+
+/**
  * @brief Check if the MEGASdk object is logged in.
  * @return 0 if not logged in, Otherwise, a number >= 0.
  */
 - (NSInteger)isLoggedIn;
+
+/**
+ * @brief Check if we are logged in into an Ephemeral account ++
+ * @return true if logged into an Ephemeral account ++, Otherwise return false
+ */
+- (BOOL)isEphemeralPlusPlus;
 
 /**
  * @brief Fetch the filesystem in MEGA.
@@ -1454,6 +1500,60 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
 
 #pragma mark - Create account and confirm account Requests
 
+/**
+ * @brief Resume a registration process for an Ephemeral++ account
+ *
+ * When a user begins the account registration process by calling
+ * [MEGASdk createEphemeralAccountPlusPlus] an ephemeral++ account is created.
+ *
+ * Until the user successfully confirms the signup link sent to the provided email address,
+ * you can resume the ephemeral session in order to change the email address, resend the
+ * signup link (@see [MEGASdk sendSignupLink] and also to receive notifications in case the
+ * user confirms the account using another client ([MegaGlobalListener onAccountUpdate] or
+ * [MEGADelegate onAccountUpdate]. It is also possible to cancel the registration process by
+ * [MEGASdk cancelCreateAccount], which invalidates the signup link associated to the ephemeral
+ * session (the session will be still valid).
+ *
+ * The associated request type with this request is MEGARequestTypeCreateAccount.
+ * Valid data in the MegaRequest object received on callbacks:
+ * - [MegaRequest getSessionKey] - Returns the session id to resume the process
+ * - [MegaRequest getParamType] - Returns the value 4
+ *
+ * In case the account is already confirmed, the associated request will fail with
+ * error MEGAErrorTypeApiEArgs.
+ *
+ * @param firstname Firstname of the user
+ * @param lastname Lastname of the user
+ */
+- (void)createEphemeralAccountPlusPlusWithFirstname:(NSString *)firstname lastname:(NSString *)lastname;
+
+/**
+ * @brief Resume a registration process for an Ephemeral++ account
+ *
+ * When a user begins the account registration process by calling
+ * [MEGASdk createEphemeralAccountPlusPlus] an ephemeral++ account is created.
+ *
+ * Until the user successfully confirms the signup link sent to the provided email address,
+ * you can resume the ephemeral session in order to change the email address, resend the
+ * signup link (@see [MEGASdk sendSignupLink] and also to receive notifications in case the
+ * user confirms the account using another client ([MegaGlobalListener onAccountUpdate] or
+ * [MEGADelegate onAccountUpdate]. It is also possible to cancel the registration process by
+ * [MEGASdk cancelCreateAccount], which invalidates the signup link associated to the ephemeral
+ * session (the session will be still valid).
+ *
+ * The associated request type with this request is MEGARequestTypeCreateAccount.
+ * Valid data in the MegaRequest object received on callbacks:
+ * - [MegaRequest getSessionKey] - Returns the session id to resume the process
+ * - [MegaRequest getParamType] - Returns the value 4
+ *
+ * In case the account is already confirmed, the associated request will fail with
+ * error MEGAErrorTypeApiEArgs
+ *
+ * @param firstname Firstname of the user
+ * @param lastname Lastname of the user
+ * @param delegate Delegate to track this request.
+ */
+- (void)createEphemeralAccountPlusPlusWithFirstname:(NSString *)firstname lastname:(NSString *)lastname delegate:(id<MEGARequestDelegate>)delegate;
 /**
  * @brief Initialize the creation of a new MEGA account.
  *
@@ -3393,6 +3493,45 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  */
 - (void)setNodeFavourite:(MEGANode *)node favourite:(BOOL)favourite;
 
+
+/**
+ * @brief Get a list of favourite nodes.
+ *
+ * The associated request type with this request is MEGARequestTypeGetAttrNode
+ * Valid data in the MEGARequest object received on callbacks:
+ * - [MEGARequest nodeHandle] - Returns the handle of the node provided
+ * - [MEGARequest paramType] - Returns MEGANodeAttributeFav
+ * - [MEGARequest numDetails] - Returns the count requested
+ *
+ * Valid data in the MEGARequest object received in onRequestFinish when the error code
+ * is MEGAErrorTypeApiOk:
+ * - [MEGARequest megaHandleList] - List of handles of favourite nodes
+ *
+ * @param node Node and its children that will be searched for favourites. Search all nodes if nil
+ * @param count if count is zero return all favourite nodes, otherwise return only 'count' favourite nodes
+ * @param delegate MEGARequestListener to track this request
+ */
+- (void)favouritesForParent:(nullable MEGANode *)node count:(NSInteger)count delegate:(id<MEGARequestDelegate>)delegate;
+
+/**
+ * @brief Get a list of favourite nodes.
+ *
+ * The associated request type with this request is MEGARequestTypeGetAttrNode
+ * Valid data in the MEGARequest object received on callbacks:
+ * - [MEGARequest nodeHandle] - Returns the handle of the node provided
+ * - [MEGARequest paramType] - Returns MEGANodeAttributeFav
+ * - [MEGARequest numDetails] - Returns the count requested
+ *
+ * Valid data in the MEGARequest object received in onRequestFinish when the error code
+ * is MEGAErrorTypeApiOk:
+ * - [MEGARequest megaHandleList] - List of handles of favourite nodes
+ *
+ * @param node Node and its children that will be searched for favourites. Search all nodes if nil
+ * @param count if count is zero return all favourite nodes, otherwise return only 'count' favourite nodes
+ */
+- (void)favouritesForParent:(nullable MEGANode *)node count:(NSInteger)count;
+
+
 /**
  * @brief Set the GPS coordinates of image files as a node attribute.
  *
@@ -3481,6 +3620,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * @param delegate Delegate to track this request.
  */
 - (void)exportNode:(MEGANode *)node delegate:(id<MEGARequestDelegate>)delegate;
+- (void)exportNodeWritable:(MEGANode *)node writable:(BOOL)writable delegate:(id<MEGARequestDelegate>)delegate;
 
 /**
  * @brief Generate a public link of a file/folder in MEGA.
@@ -3761,6 +3901,10 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * @param delegate Delegate to track this request.
  */
 - (void)setPreviewNode:(MEGANode *)node sourceFilePath:(NSString *)sourceFilePath delegate:(id<MEGARequestDelegate>)delegate;
+
+
+- (void)setPreviewByHandle:(MEGANode *)node sourceNode:(MEGANode *)sourceNode delegate:(id<MEGARequestDelegate>)delegate;
+- (void)setThumbnailByHandle:(MEGANode *)node sourceNode:(MEGANode *)sourceNode delegate:(id<MEGARequestDelegate>)delegate;
 
 /**
  * @brief Set the preview of a MEGANode.
@@ -4280,6 +4424,8 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  */
 - (void)setUserAttributeType:(MEGAUserAttribute)type value:(NSString *)value;
 
+- (void)setCustomNodeAttribute:(MEGANode *)node name:(NSString *)attrName value:(NSString *)attrValue delegate:(id<MEGARequestDelegate>)delegate;
+
 /**
  * @brief Gets the alias for an user
  *
@@ -4447,6 +4593,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * Valid data in the MEGARequest object received in onRequestFinish when the error code
  * is MEGAErrorTypeApiOk:
  * - [MEGARequest pricing] - MEGAPricing object with all pricing plans
+ * - [MEGARequest currency] - MEGACurrency object with currency data related to prices
  *
  * @param delegate Delegate to track this request.
  *
@@ -4465,6 +4612,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * Valid data in the MEGARequest object received in onRequestFinish when the error code
  * is MEGAErrorTypeApiOk:
  * - [MEGARequest pricing] - MEGAPricing object with all pricing plans
+ * - [MEGARequest currency] - MEGACurrency object with currency data related to prices 
  *
  * @see [MEGASdk getPaymentIdForProductHandle:].
  */
@@ -4934,6 +5082,8 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  */
 - (void)isMasterKeyExported;
 
+#ifdef ENABLE_CHAT
+
 /**
  * @brief Enable or disable the generation of rich previews
  *
@@ -5108,6 +5258,8 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  */
 - (void)isGeolocationEnabled;
 
+#endif
+
 /**
  * @brief Set My Chat Files target folder.
  *
@@ -5217,6 +5369,40 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * - [MEGARequest nodeHandle] - Returns the handle of the node where Camera Uploads files are stored
  */
 - (void)getCameraUploadsFolder;
+
+/**
+ * @brief Gets My Backups target folder.
+ *
+ * The associated request type with this request is MEGARequestTypeGetAttrUser
+ * Valid data in the MegaRequest object received on callbacks:
+ * - [MEGARequest paramType] - Returns the attribute type MEGAUserAttributeBackupsFolder
+ * - [MEGARequest flag] - Returns NO
+ *
+ * Valid data in the MegaRequest object received in onRequestFinish when the error code
+ * is MEGAErrorTypeApiOk:
+ * - [MEGARequest nodeHandle] - Returns the handle of the node where My Backups files are stored
+ *
+ * If the folder was not set, the request will fail with the error code MEGAErrorTypeApiENoent.
+ *
+ * @param delegate MEGARequestDelegate to track this request
+ */
+- (void)getMyBackupsFolderWithDelegate:(id<MEGARequestDelegate>)delegate;
+
+/**
+ * @brief Gets My Backups target folder.
+ *
+ * The associated request type with this request is MEGARequestTypeGetAttrUser
+ * Valid data in the MegaRequest object received on callbacks:
+ * - [MEGARequest paramType] - Returns the attribute type MEGAUserAttributeBackupsFolder
+ * - [MEGARequest flag] - Returns NO
+ *
+ * Valid data in the MegaRequest object received in onRequestFinish when the error code
+ * is MEGAErrorTypeApiOk:
+ * - [MEGARequest nodeHandle] - Returns the handle of the node where My Backups files are stored
+ *
+ * If the folder was not set, the request will fail with the error code MEGAErrorTypeApiENoent.
+ */
+- (void)getMyBackupsFolder;
 
 /**
  * @brief Get the number of days for rubbish-bin cleaning scheduler
@@ -5737,6 +5923,22 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
 */
 -(NSArray<NSDate *> *)overquotaWarningDateList;
 
+/**
+ * @brief Call the low level function setrlimit() for NOFILE, needed for some platforms.
+ *
+ * Particularly on phones, the system default limit for the number of open files (and sockets)
+ * is quite low.   When the SDK can be working on many files and many sockets at once,
+ * we need a higher limit.   Those limits need to take into account the needs of the whole
+ * app and not just the SDK, of course.   This function is provided in order that the app
+ * can make that call and set appropriate limits.
+ *
+ * @param fileCount The new limit of file and socket handles for the whole app.
+ *
+ * @return YES when there were no errors setting the new limit (even when clipped to the maximum
+ * allowed value). It returns NO when setting a new limit failed.
+ */
+- (BOOL)setRLimitFileCount:(NSInteger)fileCount;
+
 #pragma mark - Transfers
 
 /**
@@ -5869,6 +6071,8 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * Use this parameter with caution. Set it to YES only if you are sure about what are you doing.
  */
 - (void)startUploadWithLocalPath:(NSString *)localPath parent:(MEGANode *)parent appData:(nullable NSString *)appData isSourceTemporary:(BOOL)isSourceTemporary;
+
+- (BOOL)platformSetRLimitNumFile:(NSInteger)newNumFileLimit;
 
 /**
  * @brief Upload a file or a folder, putting the transfer on top of the upload queue
@@ -6092,20 +6296,14 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * @brief Reset the number of total downloads
  * This function resets the number returned by [MEGASdk totalDownloads]
  *
- * @deprecated Function related to statistics will be reviewed in future updates to
- * provide more data and avoid race conditions. They could change or be removed in the current form.
- *
  */
-- (void)resetTotalDownloads __attribute__((deprecated("They could change or be removed in the current form.")));
+- (void)resetTotalDownloads;
 
 /**
  * @brief Reset the number of total uploads
  * This function resets the number returned by [MEGASdk totalUploads]
- *
- * @deprecated Function related to statistics will be reviewed in future updates to
- * provide more data and avoid race conditions. They could change or be removed in the current form.
  */
-- (void)resetTotalUploads __attribute__((deprecated("They could change or be removed in the current form.")));
+- (void)resetTotalUploads;
 
 /**
  * @brief Cancel a transfer.
@@ -6433,91 +6631,6 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
 - (void)pauseTransferByTag:(NSInteger)transferTag pause:(BOOL)pause;
 
 /**
- * @brief Enable the resumption of transfers
- *
- * This function enables the cache of transfers, so they can be resumed later.
- * Additionally, if a previous cache already exists (from previous executions),
- * then this function also resumes the existing cached transfers.
- *
- * @note Cached downloads expire after 10 days since the last time they were active.
- * @note Cached uploads expire after 24 hours since the last time they were active.
- * @note Cached transfers related to files that have been modified since they were
- * added to the cache are discarded, since the file has changed.
- *
- * A log in or a log out automatically disables this feature.
- *
- * When the MEGASdk object is logged in, the cache of transfers is identified
- * and protected using the session and the recovery key, so transfers won't
- * be resumable using a different session or a different account. The
- * recommended way of using this function to resume transfers for an account
- * is calling it in the callback onRequestFinish related to [MEGASdk fetchNodes]
- *
- * When the MEGASdk object is not logged in, it's still possible to use this
- * feature. However, since there isn't any available data to identify
- * and protect the cache, a default identifier and key are used. To improve
- * the protection of the transfer cache and allow the usage of this feature
- * with several non logged in instances of MEGASdk at once without clashes,
- * it's possible to set a custom identifier for the transfer cache in the
- * optional parameter of this function. If that parameter is used, the
- * encryption key for the transfer cache will be derived from it.
- *
- * @param loggedOutId Identifier for a non logged in instance of MEGASdk.
- * It doesn't have any effect if MEGASdk is logged in.
- */
-- (void)enableTransferResumption:(NSString *)loggedOutId;
-
-/**
- * @brief Enable the resumption of transfers
- *
- * This function enables the cache of transfers, so they can be resumed later.
- * Additionally, if a previous cache already exists (from previous executions),
- * then this function also resumes the existing cached transfers.
- *
- * @note Cached downloads expire after 10 days since the last time they were active.
- * @note Cached uploads expire after 24 hours since the last time they were active.
- * @note Cached transfers related to files that have been modified since they were
- * added to the cache are discarded, since the file has changed.
- *
- * A log in or a log out automatically disables this feature.
- *
- * When the MEGASdk object is logged in, the cache of transfers is identified
- * and protected using the session and the recovery key, so transfers won't
- * be resumable using a different session or a different account. The
- * recommended way of using this function to resume transfers for an account
- * is calling it in the callback onRequestFinish related to [MEGASdk fetchNodes]
- *
- * When the MEGASdk object is not logged in, it's still possible to use this
- * feature. However, since there isn't any available data to identify
- * and protect the cache, a default identifier and key are used. To improve
- * the protection of the transfer cache and allow the usage of this feature
- * with several non logged in instances of MEGASdk at once without clashes,
- * it's possible to set a custom identifier for the transfer cache in the
- * optional parameter of this function. If that parameter is used, the
- * encryption key for the transfer cache will be derived from it.
- */
-- (void)enableTransferResumption;
-
-/**
- * @brief Disable the resumption of transfers
- *
- * This function disables the resumption of transfers and also deletes
- * the transfer cache if it exists. See also [MEGASdk enableTransferResumption:].
- *
- * @param loggedOutId Identifier for a non logged in instance of MEGASdk.
- * It doesn't have any effect if MEGASdk is logged in.
- */
-- (void)disableTransferResumption:(NSString *)loggedOutId;
-
-/**
- * @brief Disable the resumption of transfers
- *
- * This function disables the resumption of transfers and also deletes
- * the transfer cache if it exists. See also [MEGASdk enableTransferResumption:].
- *
- */
-- (void)disableTransferResumption;
-
-/**
  * @brief Pause/resume all transfers in one direction (uploads or downloads)
  *
  * The associated request type with this request is MEGARequestTypePauseTransfers
@@ -6723,43 +6836,33 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * - MEGASortOrderTypeModificationDesc = 8
  * Sort by modification time of the original file, descending
  *
- * - MEGASortOrderTypeAlphabeticalAsc = 9
- * Same behavior than MEGASortOrderTypeDefaultAsc
- *
- * - MEGASortOrderTypeAlphabeticalDesc = 10
- * Same behavior than MEGASortOrderTypeDefaultDesc
- *
- * - MEGASortOrderTypePhotoAsc = 11
+ * - MEGASortOrderTypePhotoAsc = 9
  * Sort with photos first, then by date ascending
  *
- * - MEGASortOrderTypePhotoDesc = 12
+ * - MEGASortOrderTypePhotoDesc = 10
  * Sort with photos first, then by date descending
  *
- * - MEGASortOrderTypeVideoAsc = 13
+ * - MEGASortOrderTypeVideoAsc = 11
  * Sort with videos first, then by date ascending
  *
- * - MEGASortOrderTypeVideoDesc = 14
+ * - MEGASortOrderTypeVideoDesc = 12
  * Sort with videos first, then by date descending
  *
- * - MEGASortOrderTypeLinkCreationAsc = 15
+ * - MEGASortOrderTypeLinkCreationAsc = 13
  *
- * - MEGASortOrderTypeLinkCreationDesc = 16
+ * - MEGASortOrderTypeLinkCreationDesc = 14
  *
- * - MEGASortOrderTypeLabelAsc = 17
+ * - MEGASortOrderTypeLabelAsc = 15
  * Sort by color label, ascending
  *
- * - MEGASortOrderTypeLabelDesc = 18
+ * - MEGASortOrderTypeLabelDesc = 16
  * Sort by color label, descending
  *
- * - MEGASortOrderTypeFavouriteAsc = 19
+ * - MEGASortOrderTypeFavouriteAsc = 17
  * Sort nodes with favourite attr first
  *
- * - MEGASortOrderTypeFavouriteDesc = 20
+ * - MEGASortOrderTypeFavouriteDesc = 18
  * Sort nodes with favourite attr last
- *
- * @deprecated MEGASortOrderTypeAlphabeticalAsc and MEGASortOrderTypeAlphabeticalDesc
- * are equivalent to MEGASortOrderTypeDefaultAsc and MEGASortOrderTypeDefaultDesc.
- * They will be eventually removed.
  *
  * @return List with all child MEGANode objects.
  */
@@ -6864,43 +6967,33 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * - MEGASortOrderTypeModificationDesc = 8
  * Sort by modification time of the original file, descending
  *
- * - MEGASortOrderTypeAlphabeticalAsc = 9
- * Same behavior than MEGASortOrderTypeDefaultAsc
- *
- * - MEGASortOrderTypeAlphabeticalDesc = 10
- * Same behavior than MEGASortOrderTypeDefaultDesc
- *
- * - MEGASortOrderTypePhotoAsc = 11
+ * - MEGASortOrderTypePhotoAsc = 9
  * Sort with photos first, then by date ascending
  *
- * - MEGASortOrderTypePhotoDesc = 12
+ * - MEGASortOrderTypePhotoDesc = 10
  * Sort with photos first, then by date descending
  *
- * - MEGASortOrderTypeVideoAsc = 13
+ * - MEGASortOrderTypeVideoAsc = 11
  * Sort with videos first, then by date ascending
  *
- * - MEGASortOrderTypeVideoDesc = 14
+ * - MEGASortOrderTypeVideoDesc = 12
  * Sort with videos first, then by date descending
  *
- * - MEGASortOrderTypeLinkCreationAsc = 15
+ * - MEGASortOrderTypeLinkCreationAsc = 13
  *
- * - MEGASortOrderTypeLinkCreationDesc = 16
+ * - MEGASortOrderTypeLinkCreationDesc = 14
  *
- * - MEGASortOrderTypeLabelAsc = 17
+ * - MEGASortOrderTypeLabelAsc = 15
  * Sort by color label, ascending
  *
- * - MEGASortOrderTypeLabelDesc = 18
+ * - MEGASortOrderTypeLabelDesc = 16
  * Sort by color label, descending
  *
- * - MEGASortOrderTypeFavouriteAsc = 19
+ * - MEGASortOrderTypeFavouriteAsc = 17
  * Sort nodes with favourite attr first
  *
- * - MEGASortOrderTypeFavouriteDesc = 20
+ * - MEGASortOrderTypeFavouriteDesc = 18
  * Sort nodes with favourite attr last
- *
- * @deprecated MEGASortOrderTypeAlphabeticalAsc and MEGASortOrderTypeAlphabeticalDesc
- * are equivalent to MEGASortOrderTypeDefaultAsc and MEGASortOrderTypeDefaultDesc.
- * They will be eventually removed.
  *
  * @return Lists with files and folders child MegaNode objects
  */
@@ -7101,6 +7194,22 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
 - (MEGAShareList *)outSharesForNode:(MEGANode *)node;
 
 /**
+ * @brief Check if a node belongs to your own cloud
+ * @param handle Node to check
+ * @return YES if it belongs to your own cloud
+ */
+- (BOOL)isPrivateNode:(uint64_t)handle;
+/**
+ * @brief Check if a node does NOT belong to your own cloud
+ *
+ * In example, nodes from incoming shared folders do not belong to your cloud.
+ *
+ * @param handle Node to check
+ * @return YES if it does NOT belong to your own cloud
+ */
+- (BOOL)isForeignNode:(uint64_t)handle;
+
+/**
  * @brief Get a list with all public links
  *
  * @param order Order for the returned list.
@@ -7275,27 +7384,6 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  */
 - (MEGAShareType)accessLevelForNode:(MEGANode *)node;
 
-/**
- * @brief Check if a node has an access level.
- *
- * @deprecated Use checkAccessErrorExtendedForNode
- *
- * @param node Node to check.
- * @param level Access level to check.
- * Valid values for this parameter are:
- * - MEGAShareTypeAccessOwner
- * - MEGAShareTypeAccessFull
- * - MEGAShareTypeAccessReadWrite
- * - MEGAShareTypeAccessRead
- *
- * @return MEGAError object with the result.
- * Valid values for the error code are:
- * - MEGAErrorTypeApiOk - The node has the required access level
- * - MEGAErrorTypeApiEAccess - The node doesn't have the required access level
- * - MEGAErrorTypeApiENoent - The node doesn't exist in the account
- * - MEGAErrorTypeApiEArgs - Invalid parameters
- */
-- (MEGAError *)checkAccessForNode:(MEGANode *)node level:(MEGAShareType)level;
 
 /**
  * @brief Check if a node has an access level
@@ -7316,23 +7404,6 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * - MEGAErrorTypeApiEArgs - Invalid parameters
  */
 - (MEGAError *)checkAccessErrorExtendedForNode:(MEGANode *)node level:(MEGAShareType)level;
-
-/**
- * @brief Check if a node can be moved to a target node.
- *
- * @deprecated User checkMoveErrorExtendedForNode
- *
- * @param node Node to check.
- * @param target Target for the move operation.
- * @return MEGAError object with the result:
- * Valid values for the error code are:
- * - MEGAErrorTypeApiOk - The node can be moved to the target
- * - MEGAErrorTypeApiEAccess - The node can't be moved because of permissions problems
- * - MEGAErrorTypeApiECircular - The node can't be moved because that would create a circular linkage
- * - MEGAErrorTypeApiENoent - The node or the target doesn't exist in the account
- * - MEGAErrorTypeApiEArgs - Invalid parameters
- */
-- (MEGAError *)checkMoveForNode:(MEGANode *)node target:(MEGANode *)target;
 
 /**
  * @brief Check if a node can be moved to a target node.
@@ -7410,43 +7481,33 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * - MEGASortOrderTypeModificationDesc = 8
  * Sort by modification time of the original file, descending
  *
- * - MEGASortOrderTypeAlphabeticalAsc = 9
- * Same behavior than MEGASortOrderTypeDefaultAsc
- *
- * - MEGASortOrderTypeAlphabeticalDesc = 10
- * Same behavior than MEGASortOrderTypeDefaultDesc
- *
- * - MEGASortOrderTypePhotoAsc = 11
+ * - MEGASortOrderTypePhotoAsc = 9
  * Sort with photos first, then by date ascending
  *
- * - MEGASortOrderTypePhotoDesc = 12
+ * - MEGASortOrderTypePhotoDesc = 10
  * Sort with photos first, then by date descending
  *
- * - MEGASortOrderTypeVideoAsc = 13
+ * - MEGASortOrderTypeVideoAsc = 11
  * Sort with videos first, then by date ascending
  *
- * - MEGASortOrderTypeVideoDesc = 14
+ * - MEGASortOrderTypeVideoDesc = 12
  * Sort with videos first, then by date descending
  *
- * - MEGASortOrderTypeLinkCreationAsc = 15
+ * - MEGASortOrderTypeLinkCreationAsc = 13
  *
- * - MEGASortOrderTypeLinkCreationDesc = 16
+ * - MEGASortOrderTypeLinkCreationDesc = 14
  *
- * - MEGASortOrderTypeLabelAsc = 17
+ * - MEGASortOrderTypeLabelAsc = 15
  * Sort by color label, ascending
  *
- * - MEGASortOrderTypeLabelDesc = 18
+ * - MEGASortOrderTypeLabelDesc = 16
  * Sort by color label, descending
  *
- * - MEGASortOrderTypeFavouriteAsc = 19
+ * - MEGASortOrderTypeFavouriteAsc = 17
  * Sort nodes with favourite attr first
  *
- * - MEGASortOrderTypeFavouriteDesc = 20
+ * - MEGASortOrderTypeFavouriteDesc = 18
  * Sort nodes with favourite attr last
- *
- * @deprecated MEGASortOrderTypeAlphabeticalAsc and MEGASortOrderTypeAlphabeticalDesc
- * are equivalent to MEGASortOrderTypeDefaultAsc and MEGASortOrderTypeDefaultDesc.
- * They will be eventually removed.
  *
  * @return List of nodes that contain the desired string in their name.
  */
@@ -7505,22 +7566,16 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * - MEGASortOrderTypeModificationDesc = 8
  * Sort by modification time of the original file, descending
  *
- * - MEGASortOrderTypeAlphabeticalAsc = 9
- * Same behavior than MEGASortOrderTypeDefaultAsc
- *
- * - MEGASortOrderTypeAlphabeticalDesc = 10
- * Same behavior than MEGASortOrderTypeDefaultDesc
- *
- * - MEGASortOrderTypePhotoAsc = 11
+ * - MEGASortOrderTypePhotoAsc = 9
  * Sort with photos first, then by date ascending
  *
- * - MEGASortOrderTypePhotoDesc = 12
+ * - MEGASortOrderTypePhotoDesc = 10
  * Sort with photos first, then by date descending
  *
- * - MEGASortOrderTypeVideoAsc = 13
+ * - MEGASortOrderTypeVideoAsc = 11
  * Sort with videos first, then by date ascending
  *
- * - MEGASortOrderTypeVideoDesc = 14
+ * - MEGASortOrderTypeVideoDesc = 12
  * Sort with videos first, then by date descending
  *
  * @param nodeFormatType Type of nodes requested in the search
@@ -7952,7 +8007,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  */
 - (BOOL)createAvatar:(NSString *)imagePath destinationPath:(NSString *)destinationPath;
 
-#ifdef HAVE_LIBUV
+#if 0 //def HAVE_LIBUV
 
 #pragma mark - HTTP Proxy Server
 
@@ -8286,6 +8341,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  */
 + (nullable NSString *)mimeTypeByExtension:(NSString *)extension;
 
+#ifdef ENABLE_CHAT
 /**
  * @brief Register a device token for iOS push notifications
  *
@@ -8341,6 +8397,8 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * @param deviceToken NSString representing the device token to be registered.
  */
 - (void)registeriOSVoIPdeviceToken:(NSString *)deviceToken;
+
+#endif
 
 /**
  * @brief Get the MEGA Achievements of the account logged in
@@ -8420,6 +8478,18 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  *
  */
 - (void)getMegaAchievements;
+
+/**
+  * @brief Catch up with API for pending actionpackets
+  *
+  * The associated request type with this request is MEGARequestTypeCatchup
+  *
+  * When onRequestFinish is called with MEGAErrorTypeApiOk, the SDK is guaranteed to be
+  * up to date (as for the time this function is called).
+  *
+  * @param delegate MEGARequestDelegate to track this request
+  */
+- (void)catchupWithDelegate:(id<MEGARequestDelegate>)delegate;
 
 /**
  * @brief Retrieve basic information about a folder link
@@ -8746,7 +8816,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * @param message Event message
  * @param delegate Delegate to track this request
  *
- * @deprecated This function is for internal usage of MEGA apps for debug purposes. This info
+ * @warning This function is for internal usage of MEGA apps for debug purposes. This info
  * is sent to MEGA servers.
  *
  * @note Event types are restricted to the following ranges:
@@ -8770,7 +8840,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
 * @param eventType Event type
 * @param message Event message
 *
-* @deprecated This function is for internal usage of MEGA apps for debug purposes. This info
+* @warning This function is for internal usage of MEGA apps for debug purposes. This info
 * is sent to MEGA servers.
 *
 * @note Event types are restricted to the following ranges:
@@ -8868,7 +8938,7 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * @param state BackUpState type backup state
  * @param delegate MEGARequestDelegate to track this request
 */
-- (void)updateBackup:(MEGAHandle)backupId backupType:(BackUpType)type targetNode:(MEGANode *)node folderPath:(nullable NSString *)path state:(BackUpState)state delegate:(id<MEGARequestDelegate>)delegate;
+- (void)updateBackup:(MEGAHandle)backupId backupType:(BackUpType)type targetNode:(MEGANode *)node folderPath:(nullable NSString *)path backupName:(NSString *)name state:(BackUpState)state delegate:(id<MEGARequestDelegate>)delegate;
 
 /**
  * @brief Unregister a backup already registered for the Backup Centre
@@ -8912,6 +8982,34 @@ typedef NS_ENUM(NSUInteger, BackupHeartbeatStatus) {
  * @param delegate MEGARequestDelegate to track this request
 */
 - (void)sendBackupHeartbeat:(MEGAHandle)backupId status:(BackupHeartbeatStatus)status progress:(NSInteger)progress pendingUploadCount:(NSUInteger)pendingUploadCount lastActionDate:(NSDate *)lastActionDate lastBackupNode:(MEGANode *)lastBackupNode delegate:(id<MEGARequestDelegate>)delegate;
+
+/**
+ * @brief Returns the name set for this device
+ *
+ * The associated request type with this request is MEGARequestTypeGetAttrUser
+ * Valid data in the request object received on callbacks:
+ * - paramType - Returns the attribute type MEGAUserAttributeDeviceNames
+ *
+ * Valid data in the MEGARequest object received in onRequestFinish when the error code
+ * is MEGAErrorTypeApiOk:
+ * - name - Returns device name.
+ *
+ * @param delegate MEGARequestDelegate to track this request
+ */
+- (void)getDeviceNameWithDelegate:(id<MEGARequestDelegate>)delegate;
+
+/**
+ * @brief Sets device name
+ *
+ * The associated request type with this request is MEGARequestTypeSetAttrUser
+ * Valid data in the MEGARequest object received on callbacks:
+ * - paramType - Returns the attribute type MEGAUserAttributeDeviceNames
+ * - name - Returns device name.
+ *
+ * @param name String with device name
+ * @param delegate MEGARequestDelegate to track this request
+ */
+- (void)setDeviceName:(NSString *)name delegate:(id<MEGARequestDelegate>)delegate;
 
 #pragma mark - Cookie Dialog
 
